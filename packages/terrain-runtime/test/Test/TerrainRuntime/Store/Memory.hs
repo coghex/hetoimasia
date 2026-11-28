@@ -33,8 +33,9 @@ import GHC.Stats (RTSStats (..), GCDetails (..), getRTSStats)
 import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Connectivity (Axis (..), ComponentKey, keyParameters, mkComponentKey)
 import Hetoimasia.Terrain.Coordinate (AxisCoord, axisFromInteger)
-import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), Todo (..), headerBytes, maxBatchUpdates, worstEdgeReads, worstEditReads)
+import Hetoimasia.Terrain.Discovery (Authority (..), Header (..), Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), Todo (..), headerBytes, maxBatchUpdates, worstEdgeReads)
 import Hetoimasia.Terrain.Residency (ArenaId (..), Revision (..))
+import Hetoimasia.Terrain.Shape (CornerMask, cornerMaskValue, mkCornerMask)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page
 import Hetoimasia.Terrain.Runtime.Store.Admission (worstTransactionCharge)
@@ -107,22 +108,42 @@ compKey p i = fromMaybe (error "component key") (mkComponentKey (tileAt (big i) 
 runNode ∷ Int → Node
 runNode i = RunNode (columnAt (big i) (big (i + 1))) (fromInteger (big (i + 2)))
 
+-- | The void of a narrowed cell, named like a run node.
+cellNode ∷ Int → Node
+cellNode i = CellNode (columnAt (big i) (big (i + 1))) (fromInteger (big (i + 2)))
+
+-- | A corner mask from 1 to 15 by the number, so that both a one-bit and a four-bit mask are held.
+maskOf ∷ Int → CornerMask
+maskOf i = either (error . show) id (mkCornerMask (1 + i `mod` 15))
+
+-- | A floor answer of either tag, at the largest ends: a run of at least one level (@lo < hi@), as the core accepts one.
+floorAnswer ∷ Int → (Int64, Int64, Replacement)
+floorAnswer i = (fromInteger (big (i + 1)), fromInteger (big i), if odd (i `div` 2) then ReplaceMask (maskOf i) else ReplaceAir)
+
+-- | The record the core keeps beside a floor answer: the run the answer names, under the key of its lower end.
+floorRecord ∷ (Int64, Int64, Replacement) → Record
+floorRecord (_, hi, ReplaceAir) = RecRun hi
+floorRecord (_, hi, ReplaceMask mask) = RecMaskRun hi mask
+
 -- | Every kind of record key, and every kind of record, as a function of a distinct number.
 keyKinds ∷ [(String, Int → RecordKey)]
 keyKinds =
   [("run key", \i → runKey (big i) (big (i + 1)) (big (i + 2)))]
     <> [("source-node key, " <> show p <> " parameters", \i → KeyLink (SrcNode (compKey p i))) | p ← [0 .. 3]]
     <> [ ("run-node key", \i → KeyLink (runNode i))
+       , ("cell-node key", \i → KeyLink (cellNode i))
        , ("todo key", \i → KeyTodo (fromInteger (big i)))
        ]
 
 recordKinds ∷ [(String, Int → Record)]
 recordKinds =
   [ ("run", \i → RecRun (fromInteger (big i)))
+  , ("mask run", \i → RecMaskRun (fromInteger (big i)) (maskOf i))
   , ("root", \i → RecRoot (Root (fromInteger (big i)) True))
   ]
     <> [("child, source node, " <> show p <> " parameters", \i → RecChild (SrcNode (compKey p (i + 7)))) | p ← [0 .. 3]]
     <> [ ("child, run node", \i → RecChild (runNode (i + 7)))
+       , ("child, cell node", \i → RecChild (cellNode (i + 7)))
        , ("todo", \i → RecTodo (Todo (tileAt (big i) (big (i + 1)) (big (i + 2))) 6))
        ]
 
@@ -192,7 +213,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
             <> [("retirement list", \i → ProbeList (fromIntegral i * 4096)), ("nothing a store could read", const ProbeNone)]
       ]
     -- READ FACT, PACKED: the encoded key and value in one map entry. The values a valid fact holds: a record of every kind, the floor
-    -- answer (16 bytes), an absent answer (empty); and the bound itself: a 64-byte key with a 64-byte value, which no valid record reaches
+    -- answer (17 bytes, of either tag), an absent answer (empty); and the bound itself: a 64-byte key with a 64-byte value, which no valid record reaches
     mFact ← lazily "Memory.mFact" $ sequence $
       [ do
           v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(kf i, Just (rf i)) | i ← is] [])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
@@ -201,14 +222,14 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       | (nm, kf, rf) ← validPairs
       ]
         <> [ do
-               v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [] [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2))), if odd i then Just (fromInteger (big i), fromInteger (big (i + 1)), ReplaceAir) else Nothing) | i ← is])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
-               pure (Variant "floor answer (16 bytes) or absent" v (Just (BS.length (encodeKey (runKey 1 1 1)) + 16 + readFactOverheadBytes)))
+               v ← retainedPer nFacts (ints nFacts) id (\is → pure (windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [] [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2))), if odd i then Just (floorAnswer i) else Nothing) | i ← is])) (emptyWindow ident0 1))) (\w → evaluate (windowReadFactCount w))
+               pure (Variant "floor answer (17 bytes, an air or a mask run) or absent" v (Just (BS.length (encodeKey (runKey 1 1 1)) + 17 + readFactOverheadBytes)))
            , do
                v ← retainedPer nFacts (ints nFacts) id (\is → pure (Map.fromList [(toShort (BS.append (be64 (fromIntegral i)) (BS.pack [fromIntegral (i + j) | j ← [1 .. maxKeyBytes - 8]])), toShort (BS.pack [fromIntegral (i + j + 3) | j ← [1 .. maxValueBytes]])) | i ← is])) (\m → evaluate (Map.size m))
                pure (Variant "the bound: a 64-byte key with a 64-byte value (not reachable by a valid record)" v (Just (maxKeyBytes + maxValueBytes + readFactOverheadBytes)))
            ]
     -- PROOF FACT: a member of the window's set of proofs; every constructor, the largest carries a version and a page
-    mProof ← lazily "Memory.mProof" $ sequence
+    mProof ← lazily "Memory.mProof" $ sequence $
       [ do
           v ← retainedPer 20000 (ints 20000) id (\is → pure (Set.fromList [mk i | i ← is])) (\st → evaluate (Set.foldl' (\acc f → acc + factWeight f) (0 ∷ Int) st))
           pure (Variant nm v Nothing)
@@ -218,8 +239,38 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
           , ("not retired", \i → FactNotRetired (PageNo (fromInteger (big i))))
           , ("not free", \i → FactNotFree (PageNo (fromInteger (big i))))
           , ("gone (version and page)", \i → FactGone (fromInteger (big i)) (PageNo (fromInteger (big (i + 1)))))
+          , ("not indexed", \i → FactNotIndexed (PageNo (fromInteger (big i))))
+          , ("a reduced chunk", \i → FactChunk i)
+          , ("out of (a page and a root)", \i → FactOutOf (PageNo (fromInteger (big i))) (PageNo (fromInteger (big (i + 1)))))
           ]
       ]
+    -- MEMOS AND COMPLETED PROOFS: an edit's memo of a neighbouring chain holds its bounds by value, measured at each length of key a tree holds
+    -- (the allocator's 8, the retirement tree's 9, the longest a record tree has), both bounds present, against the figure 'factBytesOf' accounts for
+    -- it; and the facts of completed pages, one each, with the units of their proofs dropped (measured BEFORE the facts are read: a lazily filtered
+    -- list would hold the units until something forced it)
+    mMemo ← lazily "Memory.mMemo" $ sequence $
+      [ do
+          v ← retainedPer 20000 (ints 20000) id (\is → pure (Set.fromList [memoOf len i | i ← is])) (\st → evaluate (Set.foldl' (\acc f → acc + factWeight f) (0 ∷ Int) st))
+          pure (Variant ("memo of a chain, bounds of " <> show len <> " bytes") v (Just (factBytesOf (memoOf len 1))))
+      | len ← [8, retireKeyBytes, maxKeyBytes]
+      ]
+        -- a memo the window carries and an edit uses again is held ONCE by both: the edit keeps the window's value, not the copy the lookup
+        -- built to ask for it (measured with the window and the edit alive together, the asking copies dropped)
+        <> [ do
+               v ← retainedPer 400 (ints 400) id (\is → pure (sharedMemos is)) (\(w, e) → evaluate (windowFactCount w + length (editFacts e)))
+               -- against what the PRODUCTION ledger charges for the same structures: the window's set entry and the edit's list cell of each
+               pure (Variant "memos a window carries and an edit has used, held together (one copy of each)" v (Just (editHeldMemoBytes (snd (sharedMemos [1])))))
+           ]
+        -- the bounds are slices of a 4 KiB page buffer when the memo is made: the memo copies them (and forces the copies), so it keeps nothing
+        -- of the buffer, measured with the buffers dropped and the bounds NOT read before the measurement
+        <> [ do
+               v ← retainedPer 400 (ints 400) id (\is → pure (Set.fromList [edgeFact TreeRetire True (PageNo (fromInteger (big i))) (fromIntegral i) (Just (BS.take retireKeyBytes (BS.drop 100 (page4k i)))) (Just (BS.take retireKeyBytes (BS.drop 2000 (page4k i)))) (Just 1) | i ← is])) (\st → evaluate (Set.foldl' (\acc f → acc + pageOf f) (0 ∷ Int) st))
+               pure (Variant "memo made from slices of page buffers, the buffers dropped (bounds not read)" v (Just (factBytesOf (memoOf retireKeyBytes 1))))
+           ]
+        <> [ do
+               v ← retainedPer 400 (ints 400) id (\is → pure (foldl' (\e i → recordProof (FactUnreachable (PageNo (fromInteger (big i)))) (PageNo (fromInteger (big i))) (foldl' (\e' r → recordFact (FactOutOf (PageNo (fromInteger (big i))) (PageNo (fromInteger (big (i + r))))) e') e [1 .. 16])) (newEdit 0 (emptyWindow ident0 1)) is)) (\e → evaluate (editFreshBytes e))
+               pure (Variant "the proofs of completed pages: one fact each, their 16 root units dropped (read before the facts are forced)" v (Just (factBytes + 24)))
+           ]
     -- LISTS AND SETS OF PAGE NUMBERS: the replaced pages of an edit are a set, the supply and the loose pages are lists
     mCell ← lazily "Memory.mCell" $ sequence
       [ do
@@ -318,8 +369,13 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       | (nm, kf, rf) ← validPairs
       ]
         <> [ do
-               v ← retainedPer 3000 (ints 3000) id (\is → pure (let m = Map.fromList [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2)) ∷ Int64), if odd i then Just (fromInteger (big i) ∷ Int64, fromInteger (big (i + 1)) ∷ Int64) else Nothing) | i ← is] in (m, Map.toAscList m))) (\(m, l) → evaluate (Map.size m + length l))
-               pure (Variant "floor query (a column and a level) with its answer" v Nothing)
+               v ← retainedPer 3000 (ints 3000) id (\is → pure (floorReadsOf payload is)) (evaluate . floorReadWeight)
+               pure (Variant ("floor query that found " <> nm <> " (the floor map's answer and the run's record, each with its list)") v Nothing)
+           | (nm, payload) ← [("an air run", const ReplaceAir), ("a mask run", ReplaceMask . maskOf)]
+           ]
+        <> [ do
+               v ← retainedPer 3000 (ints 3000) id (\is → pure (let m = Map.fromList [((columnAt (big i) (big (i + 1)), fromInteger (big (i + 2)) ∷ Int64), Nothing ∷ Maybe (Int64, Int64, Replacement)) | i ← is] in (m, Map.toAscList m))) (\(m, l) → evaluate (Map.size m + length l))
+               pure (Variant "floor query with no run below the level (the absent answer, measured apart)" v Nothing)
            ]
     -- DISCOVERY HEADER: the always-resident control record (an authority and three counters), every field at its largest
     mHeader ← lazily "Memory.mHeader" (retainedPer 1000 (ints 1000) id (\is → pure [headerOf i | i ← is]) (\hs → evaluate (sum [fromIntegral (hHead h) + fromIntegral (hTail h) + hBytes h | h ← hs])))
@@ -328,6 +384,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       , Row "probe (map entry + key)" "the longest key a valid page holds is 52 bytes (the links tree); the bound a page could carry is 64 (maxKeyBytes), measured too" (Just "key of 64 bytes") probeBytes mProbe
       , Row "read fact, packed (key + value + entry)" "the longest valid key (52) with the longest valid value (53, a child that is a source node); encoded, so the optional coordinates of the typed form do not matter; the bound (64 + 64) is measured too" Nothing recordFactBytes mFact
       , Row "proof fact in a Set" "the constructor with the most fields: a version and a page" (Just "gone (version and page)") factBytes mProof
+      , Row "memo of a neighbouring chain, and the facts of completed proofs" "a memo holds the bounds of a chain by value: the longest key a record tree holds (64 bytes) at both ends; the facts of a completed page's proof are one each" (Just "memo of a chain, bounds of 64 bytes") (factBytesOf (memoOf maxKeyBytes 1)) mMemo
       , Row "page-number list cell (supply, loose pages)" "a cons cell and a boxed number" Nothing pageListCellBytes (take 1 mCell)
       , Row "page-number set element (the replaced pages of an edit)" "a map node, the boxed number and the pointers" Nothing pageSetElemBytes (drop 1 mCell)
       , Row "root set at the loose cap" "every Maybe root present, the header at its largest, five checksums, the loose list at its cap of 1,024 distinct pages" (Just "every root present, header at its largest, 5 checksums, loose list at its cap") rootRecordBytes mRoots
@@ -393,15 +450,15 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       [r] → do
         let m = ceiling (varMeasured (rowMax r)) ∷ Int
             -- restated here from the raw figures, independent of the derivation: the typed reads, a full window and its probes, the packed
-            -- facts at their ceiling, the proof facts of a replayed read phase, the writes staging holds (192 at writeRetainedBytes) and
+            -- facts at their ceiling, the proof facts and the memos of a replayed read phase, the writes staging holds (192 at writeRetainedBytes) and
             -- the fixed records
-            peak n = n * m + maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + maxProofFacts * factBytes + 3 * maxBatchUpdates * writeRetainedBytes + readPhaseFixedBytes
-        -- a removal reads at most worstEditReads, a unit of discovery worstEdgeReads, a batch the cap; each fits
-        forM_ [worstEdgeReads, worstEditReads, maxTypedReads] $ \n → (n, peak n <= txnRamLimit) `shouldBe` (n, True)
+            peak n = n * m + maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + maxProofFacts * factBytes + maxMemoBytes + 3 * maxBatchUpdates * writeRetainedBytes + readPhaseFixedBytes
+        -- a removal or a narrowing reads at most maxEditReads, a unit of discovery worstEdgeReads, a batch the cap; each fits
+        forM_ [worstEdgeReads, maxEditReads, maxTypedReads] $ \n → (n, peak n <= txnRamLimit) `shouldBe` (n, True)
         -- and the cap is above what a removal or one inspection can read, so it is never what refuses them
-        (maxTypedReads >= worstEditReads, maxTypedReads >= worstEdgeReads) `shouldBe` (True, True)
+        (maxTypedReads >= maxEditReads, maxTypedReads >= worstEdgeReads) `shouldBe` (True, True)
         -- the cap is the largest the ACCOUNTED typed read allows: one more read at the accounted figure would not fit
-        let fixed = maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + maxProofFacts * factBytes + 3 * maxBatchUpdates * writeRetainedBytes + readPhaseFixedBytes
+        let fixed = maxWindowBytes + worstOwnershipBytes + maxReadFactBytes + maxProofFacts * factBytes + maxMemoBytes + 3 * maxBatchUpdates * writeRetainedBytes + readPhaseFixedBytes
         (maxTypedReads * typedReadBytes + fixed <= txnRamLimit, (maxTypedReads + 1) * typedReadBytes + fixed > txnRamLimit) `shouldBe` (True, True)
       other → expectationFailure ("expected one typed-read row, found " <> show (length other))
   it "a Facts value of N read facts and N proof facts retains no more than factsRetainedBytes says (measured on one value, accounted on another)" $ do
@@ -418,6 +475,22 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
     unless (nFacts > 0) (expectationFailure "no facts")
   where
     ints n = [1 .. n] ∷ [Int]
+    -- what the floor lookups of the core retain when they SUCCEED, one for each number with the given payload: the answer in its floor
+    -- map (under the column and a level in the run) and the run it names in its record map (under its own key, the column and the lower
+    -- end), and both maps again as the ascending lists the read set is handed over as, all alive together
+    floorReadsOf payload is =
+      let runs = [(columnAt (big i) (big (i + 2)), (lo, hi, payload i)) | i ← is, let (lo, hi, _) = floorAnswer i]
+          floors = Map.fromList [((col, hi - 1), Just run) | (col, run@(_, hi, _)) ← runs]
+          cache = Map.fromList [(KeyRun col lo, Just (floorRecord run)) | (col, run@(lo, _, _)) ← runs]
+       in (floors, cache, Map.toAscList floors, Map.toAscList cache)
+    -- forces every field the lookup holds: the ends, the mask (a lazy field would measure as a thunk), the run record's bytes
+    floorReadWeight (floors, cache, floorList, cacheList) =
+      Map.size floors + Map.size cache + length floorList + length cacheList
+        + sum [fromIntegral lo + fromIntegral hi + payloadWeight p | (_, Just (lo, hi, p)) ← floorList]
+        + sum (map recordWeight cacheList)
+    payloadWeight p = case p of
+      ReplaceAir → 0
+      ReplaceMask mask → fromIntegral (cornerMaskValue mask)
     typedReadsOf kf rf is =
       let m = Map.fromList [(kf i, Just (rf i)) | i ← is]
        in (m, Map.toAscList m)
@@ -432,6 +505,20 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       FactNotRetired (PageNo p) → fromIntegral p
       FactNotFree (PageNo p) → fromIntegral p
       FactGone v (PageNo p) → fromIntegral (v + p)
+      FactOutOf (PageNo a) (PageNo b) → fromIntegral (a + b)
+      FactNotIndexed (PageNo p) → fromIntegral p
+      FactChunk n → n
+      FactEdge _ side (PageNo p) crc lo hi lvl → fromEnum side + fromIntegral p + fromIntegral crc + maybe 0 SBS.length lo + maybe 0 SBS.length hi + lvl
+    -- a window that carries the memos of the given numbers, and an edit over it that has used each again through a fresh copy of the lookup
+    sharedMemos is =
+      let w = windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [memoOf retireKeyBytes i | i ← is] noReadFacts) (emptyWindow ident0 1)
+       in (w, foldl' (\e i → useMemo (memoOf retireKeyBytes i) e) (newEdit 0 w) is)
+    page4k i = BS.pack [fromIntegral (i + j) | j ← [1 .. pageSize]]
+    pageOf f = case f of
+      FactEdge _ _ (PageNo p) _ _ _ _ → fromIntegral p
+      _ → 0
+    memoOf len i =
+      FactEdge TreeRuns (even i) (PageNo (fromInteger (big i))) (fromIntegral i) (Just (toShort (BS.pack [fromIntegral (i + j) | j ← [1 .. len]]))) (Just (toShort (BS.pack [fromIntegral (i + j + 7) | j ← [1 .. len]]))) (i `mod` 8)
     rootsOf full loose i =
       let pg k = if full then Just (PageNo (fromInteger (big (i + k)))) else Nothing
        in Roots

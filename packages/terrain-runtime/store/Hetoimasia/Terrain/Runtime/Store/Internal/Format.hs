@@ -69,9 +69,12 @@ pageChecksumOffset = pageSize - 4
 pagePayloadBytes ∷ Int
 pagePayloadBytes = pageChecksumOffset - pageHeaderBytes
 
--- | The only format version this implementation reads or writes.
+-- | The only format version this implementation reads or writes. Version 2 replaces version 1 for every page of a
+-- session file (one header version covers all five trees and the retirement lists): a run carries a tagged payload and a
+-- link may name a narrowed cell. There is no reader of version 1 and no mixed-version store; the file lives for one arena
+-- session.
 formatVersion ∷ Word16
-formatVersion = 1
+formatVersion = 2
 
 -- | The most new pages one update of a tree of the given height writes: a copy of the path, a split at every level and a new
 -- root. The ONE definition: the bookkeeping reserve, the pages the worst removal and the smallest unit of discovery write, and
@@ -178,7 +181,7 @@ newtype PageNo = PageNo Word64
 -- | The five indexes. The first three hold #661's logical record categories; the
 -- last two are the allocator and the retirement work.
 data TreeId
-  = -- | Removed intervals: @KeyRun column lo → RecRun hi@.
+  = -- | Tagged replacement runs: @KeyRun column lo → RecRun hi@ (air) or @RecMaskRun hi mask@.
     TreeRuns
   | -- | Component, union and knowledge records: @KeyLink node@.
     TreeLinks

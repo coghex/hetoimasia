@@ -7,13 +7,14 @@
 -- the facade documents, for EVERY starting work limit from 1 to 64, for discovery, a standalone removal and maintenance, under
 -- the standard bounds and under the tightest window the at-once bounds allow: pending work always drains, and no step
 -- ever answers 'Invalid', 'Integrity', 'Stale' or any capacity the protocol does not name.
-module Test.TerrainRuntime.Store.Protocol (spec, fullSpec) where
+module Test.TerrainRuntime.Store.Protocol (spec, fullSpec, driveFrom) where
 
 import Control.Monad (foldM, forM, forM_)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Short as SBS
 import Hetoimasia.Terrain.Coordinate (TileCoord)
-import Hetoimasia.Terrain.Discovery (Allowance (..), Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, maxBatchUpdates, Step (..), candidateReport, reportWrites, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites, worstEditReads, worstEditWrites)
+import Hetoimasia.Terrain.Discovery (Allowance (..), Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, maxBatchUpdates, Step (..), candidateReport, reportWrites, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
@@ -52,10 +53,10 @@ drive ∷ H → Int → (H → Window → Planned) → Either String (H, Planned
 drive h0 limit = driveFrom h0 (limitWork limit (storeWindow (hStore h0)))
 
 -- | The most steps (pages fetched and checkpoints) a plan through the protocol may take: every checkpoint carries at least one new
--- read fact, a removal reads at most 'worstEditReads' records (+1 for the end of its read phase) and a window fetches at most
+-- read fact, a removal reads at most 'maxEditReads' records (+1 for the end of its read phase) and a window fetches at most
 -- 'maxWindowPages' pages between two checkpoints.
 maxProtocolSteps ∷ Int
-maxProtocolSteps = (worstEditReads + 1) * (maxWindowPages + 1) + 1000
+maxProtocolSteps = (maxEditReads + 1) * (maxWindowPages + 1) + 1000
 
 -- | 'drive' from a given window (one that may carry facts). The caller is the PRODUCTION driver
 -- ("Hetoimasia.Terrain.Runtime.Store.Internal.Protocol"), which the terrain owner runs: this loop only supplies the pages it
@@ -154,7 +155,9 @@ unboundedReads ∷ Bounds
 unboundedReads = standardBounds {bdWindowPages = 1000000, bdWindowBytes = maxBound `div` 2, bdReadResidue = maxBound}
 
 tightBounds ∷ Int → Bounds
-tightBounds lim = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes}
+-- | A window of the given pages and a read residue of a few: the read phase hands what it read on as facts as soon as it holds more, so the
+-- checkpoints these tests exercise happen whatever the residue of the production bounds leaves a read phase.
+tightBounds lim = standardBounds {bdWindowPages = lim, bdWindowBytes = lim * windowPageBytes, bdReadResidue = 8}
 
 recordHeight ∷ H → Int
 recordHeight h = maximum [heightOf h t | t ← [TreeRuns, TreeLinks, TreeTodo]]
@@ -492,13 +495,28 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     -- (derived: the whole pages the worst removal leaves in the byte limit beside its probes at the MEASURED page and probe costs)
     (readResiduePages >= 1) `shouldBe` True
     -- the probe figures are counted from the pages written, in one place
-    (removalWorstProbes, discoveryUnitWorstProbes) `shouldBe` (worstEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve, discoveryUnitWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve)
-    (removalWorstProbes, discoveryUnitWorstProbes, minimumRemovalPages) `shouldBe` (188, 120, 188)
+    (removalWorstProbes, discoveryUnitWorstProbes) `shouldBe` (maxEditWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve, discoveryUnitWrites * worstUpdatePages (maxLevel + 1) + 1 + bookkeepingReserve)
+    (removalWorstProbes, discoveryUnitWorstProbes, minimumRemovalPages) `shouldBe` (205, 120, 205)
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders) * windowPageBytes + removalWorstProbes * probeBytes <= maxWindowBytes) `shouldBe` True
     ((removalWindowPages maxRetireInternals (maxLevel + 1) (maxLevel + 1) maxReaders + 1) * windowPageBytes + removalWorstProbes * probeBytes > maxWindowBytes) `shouldBe` True
+    -- the window's byte limit is DERIVED, as it was approved: the whole pages of the worst explicit edit (a tagged edit of eight record writes) at the
+    -- tallest trees with every reader pinned and a path of each root (306 pages, 1,312,128 bytes), its ownership probes and one read's page,
+    -- rounded up to 64 KiB, and no larger: 1,376,256 bytes, and the next multiple down would not hold it
+    let h8 = maxLevel + 1
+        approvedPages = maxEditWrites * h8 + (maxEditWrites * h8 + 1) + maxRetireInternals + 3 * h8 + (1 + maxReaders) * h8
+        approvedNeeded = approvedPages * windowPageBytes + removalWorstProbes * probeBytes + windowPageBytes
+    (approvedPages, maxWindowBytes >= approvedNeeded, maxWindowBytes - approvedNeeded < 64 * 1024, maxWindowBytes `mod` (64 * 1024)) `shouldBe` (306, True, True, 0)
+    (maxWindowBytes - 64 * 1024 < approvedNeeded) `shouldBe` True
+    -- the planner's own requirement now (one proof of one root at a time) is checked against that ceiling apart: it holds the edit and a landing,
+    -- fits the approved window with the probes and a page to spare, and the read residue is what it leaves
+    let needed = editWindowPages maxEditWrites maxRetireInternals h8 h8 maxReaders * windowPageBytes + removalWorstProbes * probeBytes + windowPageBytes
+    (needed <= maxWindowBytes, editWindowPages maxEditWrites maxRetireInternals h8 h8 maxReaders <= approvedPages) `shouldBe` (True, True)
+    -- and the byte limit is no larger than the planner needs: the next multiple of 64 KiB down would not hold the planner's own requirement
+    printLine ("READPHASE window: the planner needs " <> show needed <> " B, the limit is " <> show maxWindowBytes <> " B, the next multiple down " <> show (maxWindowBytes - 64 * 1024) <> " B")
+    (maxWindowBytes - 64 * 1024 < needed) `shouldBe` True
     -- the facts of the worst removal and of a discovery unit are RAM the feasibility proofs count, and they fit
-    (worstEditReads * recordFactBytes <= maxReadFactBytes, worstEdgeReads * recordFactBytes <= maxReadFactBytes) `shouldBe` (True, True)
-    printLine ("READPHASE bounds: residue " <> show readResiduePages <> " pages; promised removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", discovery unit = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> ", one read at 8 levels = " <> show (readPathPages 8) <> "; facts: removal " <> show (worstEditReads * recordFactBytes) <> " B, discovery unit " <> show (worstEdgeReads * recordFactBytes) <> " B, ceiling " <> show maxReadFactBytes)
+    (maxEditReads * recordFactBytes <= maxReadFactBytes, worstEdgeReads * recordFactBytes <= maxReadFactBytes) `shouldBe` (True, True)
+    printLine ("READPHASE bounds: residue " <> show readResiduePages <> " pages; promised removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", discovery unit = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> ", one read at 8 levels = " <> show (readPathPages 8) <> "; facts: removal " <> show (maxEditReads * recordFactBytes) <> " B, discovery unit " <> show (worstEdgeReads * recordFactBytes) <> " B, ceiling " <> show maxReadFactBytes)
   it "removes the cell between two runs whose chains are 12 and 64 links long at EXACTLY the promised bound, and plans what the standard bounds plan" $ do
     forM_ [12, 64] $ \hops → do
       (h, env, tile) ← must (chainStore hops 8192)
@@ -523,15 +541,129 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
       -- the proof phase holds no more probes than the pages the removal writes, which 'removalWorstProbes' is derived from
       (cProbePeak (cOf tight) <= removalWorstProbes, cProbePeak (cOf std) <= removalWorstProbes) `shouldBe` (True, True)
       printLine ("READPHASE removal " <> show hops <> " hops: most probes a window held " <> show (cProbePeak (cOf tight)) <> " (tight), " <> show (cProbePeak (cOf std)) <> " (standard) of " <> show removalWorstProbes)
+  it "takes a smaller discovery batch only through a checkpoint that publishes its allowance and holds none of the window's memos, and the batch resumed from it is planned" $ do
+    -- a RAM bound that stops the batch after fewer updates (the batch of the scene is refused for it, a shrinkable refusal): the planner answers
+    -- with a checkpoint whose fact is the halved allowance, the window it hands on carries the reduced work limit and no memo, and the call
+    -- planned from that window is the smaller batch; the window the trace starts from carries a memo
+    run0 ← pure (newRun smallSpec twoOpenings 64)
+    r1 ← must (foldM (\r (x, y, z) → removeCell r (tileAt x y z)) run0 openingA)
+    let scene = runEnv run0
+        h1 = runH r1
+        store = hStore h1
+        -- room for the keys of three record writes (writeRetainedBytes each) and not of six: the batch of the scene is refused as shrinkable RAM
+        tight = standardBounds {bdWorst = worstPlanCharge {ramKeys = 4 * writeRetainedBytes}}
+        fp = fingerprintOf (hIdent h1) (storeRoots store) []
+        bound = Just (SBS.toShort (BS.replicate 8 7))
+        memo = FactEdge TreeLinks True (PageNo 5) 99 bound bound 0
+        carrying = windowCheckpoint (Facts fp [memo] noReadFacts) (limitWork 64 (storeWindow store))
+        total = cfgUsablePages (hCfg h1)
+        trace w calls (k ∷ Int)
+          | k > 4000 = Left "no answer"
+          | otherwise = case planDiscoveryWith tight scene store w of
+              Pending p → case diskRead (hDisk h1) p of
+                Just bs → either (Left . show) (\w' → trace w' calls (k + 1)) (windowInsert total p bs w)
+                Nothing → Left "missing page"
+              PendingProbes ps → trace (foldl (\w' p → windowProbe total p (maybe BS.empty id (diskRead (hDisk h1) p)) w') w ps) calls (k + 1)
+              Checkpoint facts@(Facts _ fs _) →
+                let w' = windowCheckpoint facts w
+                 in trace w' ((not (null [() | FactChunk _ ← fs]), windowWork w, windowWork w', windowMemoBytes w') : calls) (k + 1)
+              other → Right (other, reverse calls)
+    (full, _, _) ← must (fillWith h1 (planDiscovery scene store))
+    (answer, calls) ← must (trace carrying [] 0)
+    printLine ("DISCOVERY reduction under a page bound (a reduction, limit before, after, memo bytes after): " <> show calls <> "; full " <> show (case full of Planned a → (mUpdates (plMeasure a), mRecordWrites (plMeasure a), mPagesWritten (plMeasure a)); _ → (0, 0, 0)) <> "; answer " <> take 80 (show answer))
+    -- a reduction was taken, from the full limit down, and it handed on no memo
+    [() | (True, limBefore, limAfter, memos) ← calls, limAfter < limBefore, memos == 0] `shouldSatisfy` (not . null)
+    -- every checkpoint hands on a window without the memo the trace started with
+    [() | (_, _, _, memos) ← calls, memos /= 0] `shouldBe` []
+    case (full, answer) of
+      (Planned a, Planned b) → (0 < mUpdates (plMeasure b), mUpdates (plMeasure b) < mUpdates (plMeasure a), mRecordWrites (plMeasure b) <= 3) `shouldBe` (True, True, True)
+      other → expectationFailure ("both batches were expected, got " <> take 300 (show other))
+  it "never requests a page past a full window: a window of one page that holds the root answers the typed window result at once, to an edit that needs a leaf" $ do
+    -- INVARIANT 1: a window that is full never requests, and so never receives, another page. A tree of two levels, a window of one page, an edit
+    -- of an absent key: the driver asks for the root (the window is empty), and for nothing after it
+    let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. 2999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    h ← must (foldM (\hh ks → commit hh [(k, Just (runRec 20)) | k ← ks]) (newH smallSpec ident0) (chunks keys))
+    heightOf h TreeRuns `shouldSatisfy` (>= 2)
+    let one = standardBounds {bdWindowPages = 1, bdWindowBytes = windowPageBytes}
+        delta = deltaFor (hStore h) True False 1 [(runKey 5 60 10, Just (runRec 20))]
+        planner w = planDeltaPinned one (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) w Ordinary delta
+        run d requests (n ∷ Int)
+          | n > 200 = Left "the protocol did not settle"
+          | otherwise = case P.advance d of
+              (d', Continue) → run d' requests (n + 1)
+              (d', NeedPages ps) →
+                let held = windowSize (driverWindow d')
+                 in do
+                      d'' ← foldM (\dd p → maybe (Left "missing page") (\bs → first supplyText (supplyPage p bs dd)) (diskRead (hDisk h) p)) d' ps
+                      run d'' ((held, ps) : requests) (n + 1)
+              (_, step) → Right (reverse requests, stepName step)
+    (requests, ending) ← must (run (newDriverIn (hStore h) (storeWindow (hStore h)) planner) [] 0)
+    -- every page was asked for by a window that held fewer than its one page; the plan ended in a refusal or a stall, never in a plan
+    ([held | (held, _) ← requests, held >= 1], null requests, ending `elem` ["Refuse", "Stuck"]) `shouldBe` ([], False, True)
+  it "plans a discovery batch refused for a continuation its larger batch's reads would fill, from a window released of them: the reduction hands on no read fact" $ do
+    -- INVARIANT 2: a reduction releases all the state of the batch it abandons. The read phase hands its reads on as facts at each checkpoint; the
+    -- batch of the scene is refused for the continuation bound (shrinkable), and the continuation bound admits the smaller batch ALONE: the
+    -- smaller batch is planned from a window that carries none of the larger one's packed reads
+    run0 ← pure (newRun smallSpec twoOpenings 64)
+    r1 ← must (foldM (\r (x, y, z) → removeCell r (tileAt x y z)) run0 openingA)
+    let scene = runEnv run0
+        h1 = runH r1
+        store = hStore h1
+        base = standardBounds {bdReadResidue = 0}
+        plannerOf bounds = planDiscoveryWith bounds scene store
+        total = cfgUsablePages (hCfg h1)
+    (full, _, _) ← must (fillFrom h1 (storeWindow store) (plannerOf base))
+    (unit, _, _) ← must (fillFrom h1 (limitWork 3 (storeWindow store)) (plannerOf base))
+    case (full, unit) of
+      (Planned a, Planned b) → do
+        let admits = ramContinuation (mRam (plMeasure b))
+            bounded = base {bdWorst = worstPlanCharge {ramContinuation = admits}}
+            trace w calls (k ∷ Int)
+              | k > 4000 = Left "no answer"
+              | otherwise = case plannerOf bounded w of
+                  Pending p → case diskRead (hDisk h1) p of
+                    Just bs → either (Left . show) (\w' → trace w' calls (k + 1)) (windowInsert total p bs w)
+                    Nothing → Left "missing page"
+                  PendingProbes ps → trace (foldl (\w' p → windowProbe total p (maybe BS.empty id (diskRead (hDisk h1) p)) w') w ps) calls (k + 1)
+                  Checkpoint facts@(Facts _ fs _) →
+                    let w' = windowCheckpoint facts w
+                     in trace w' ((not (null [() | FactChunk _ ← fs]), windowReadFactCount w, windowReadFactCount w') : calls) (k + 1)
+                  other → Right (other, reverse calls)
+        (answer, calls) ← must (trace (storeWindow store) [] 0)
+        printLine ("DISCOVERY continuation bound " <> show admits <> " (a reduction, read facts before, after): " <> show calls <> "; full continuation " <> show (ramContinuation (mRam (plMeasure a))))
+        -- the larger batch does not fit the bound alone, and the smaller one does
+        (ramContinuation (mRam (plMeasure a)) > admits) `shouldBe` True
+        -- a reduction was taken from a window that held read facts, and handed none on
+        [() | (True, readsBefore, readsAfter) ← calls, readsBefore > 0, readsAfter == 0] `shouldSatisfy` (not . null)
+        case answer of
+          Planned pl → (0 < mUpdates (plMeasure pl), mUpdates (plMeasure pl) < mUpdates (plMeasure a), ramContinuation (mRam (plMeasure pl)) <= admits) `shouldBe` (True, True, True)
+          other → expectationFailure ("the smaller batch was expected, got " <> take 200 (show other))
+      other → expectationFailure ("both batches were expected, got " <> take 300 (show other))
+  it "counts no negative window for an empty tree: every page count is zero or more at heights 0 to 8, and the first removal's promised window is a whole window" $ do
+    -- an empty tree has height zero: a record write reads and replaces no page of it and a landing holds none (a negative count would have made
+    -- the window of the first removal on a new store negative, refused by the window check before it began)
+    let hs = [0 .. maxLevel + 1]
+        grid = [(hf, hrec, pins) | hf ← hs, hrec ← hs, pins ← [0, maxReaders]]
+    [g | g@(hf, hrec, pins) ← grid, removalWindowPages maxRetireInternals hf hrec pins < 0 || discoveryUnitWindowPages maxRetireInternals hf hrec pins < 0 || workOneWindowPages hf hf hrec pins < 0] `shouldBe` []
+    (worstReplacedPerWrite 0, readLandingPages 0, readLandingPages 1) `shouldBe` (0, 0, 1)
+    let hNew = newH smallSpec ident0
+    (recordHeight hNew, removalPromise hNew > 0, removalPromise hNew <= maxWindowBytes `div` windowPageBytes) `shouldBe` (0, True, True)
   it "caps the reads of a read phase at what its typed set can hold, and the cap is never a refusal: a removal and a unit fit, a batch ends early" $ do
     -- the derived cap is above everything one removal or one inspection can read (so neither can be refused for it) and below what a
     -- default batch may ask for (so it is the cap that ends a long batch, not the allowance of #661)
-    (maxTypedReads >= worstEditReads, maxTypedReads >= worstEdgeReads, maxTypedReads < maxBatchUpdates * worstEdgeReads) `shouldBe` (True, True, True)
+    (maxTypedReads >= maxEditReads, maxTypedReads >= worstEdgeReads, maxTypedReads < maxBatchUpdates * worstEdgeReads) `shouldBe` (True, True, True)
     -- a removal at EXACTLY its worst read count plans what the standard bounds plan
     (h, env, tile) ← must (chainStore 64 8192)
     let planner bounds hh w = planRemovalWith bounds env (hStore hh) w tile
     std ← must (runThrough h 64 (planner standardBounds))
-    capped ← must (runThrough h 64 (planner (standardBounds {bdMaxReads = worstEditReads})))
+    capped ← must (runThrough h 64 (planner (standardBounds {bdMaxReads = maxEditReads})))
     samePlan (runPlan std) (runPlan capped) `shouldBe` True
     -- a discovery over chains of 40 links (an inspection reads up to 132 records) with the cap at ONE inspection's worst read count and
     -- above it: every batch is planned (never a refusal), a lower cap ends a batch earlier with fewer updates, and every cap drains to
@@ -549,7 +681,7 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
       (hc, n, _) ← must (drainThrough hd 64 (batchPlanner cap))
       rc ← must (recordsOfStore hc)
       pure (n, rc == recStd, pendingObligations (storeHeader (hStore hc)))
-    printLine ("READPHASE read cap " <> show maxTypedReads <> " (removal needs at most " <> show worstEditReads <> ", an inspection " <> show worstEdgeReads <> "); updates in the first batch at caps " <> show caps <> " = " <> show updates <> " (standard bounds " <> show (mUpdates (plMeasure (runPlan stdBatch))) <> "); batches to drain " <> show (map (\(n, _, _) → n) drained) <> " (standard " <> show nStd <> ")")
+    printLine ("READPHASE read cap " <> show maxTypedReads <> " (removal needs at most " <> show maxEditReads <> ", an inspection " <> show worstEdgeReads <> "); updates in the first batch at caps " <> show caps <> " = " <> show updates <> " (standard bounds " <> show (mUpdates (plMeasure (runPlan stdBatch))) <> "); batches to drain " <> show (map (\(n, _, _) → n) drained) <> " (standard " <> show nStd <> ")")
     -- the cap at one inspection ends the batch after fewer updates than a cap that holds more; every cap drains to the same records
     -- (the fixture's batches read few records, so the caps above do not bite: every cap plans the same batch, which is the point of a
     -- cap that is never a refusal. The cut itself is shown at #661's step below.)
@@ -650,7 +782,7 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     let planner bounds hh w = planRemovalWith bounds env (hStore hh) w tile
         firstCheckpoint w n
           | n > (4000 ∷ Int) = expectationFailure "no checkpoint" >> fail "cp"
-          | otherwise = case planner standardBounds h w of
+          | otherwise = case planner (tightBounds (removalPromise h)) h w of
               Pending p → case diskRead (hDisk h) p >>= \bs → either (const Nothing) Just (windowInsert (cfgUsablePages (hCfg h)) p bs w) of
                 Just w' → firstCheckpoint w' (n + 1)
                 Nothing → expectationFailure "page" >> fail "page"

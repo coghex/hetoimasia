@@ -75,6 +75,8 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Model
   , planEdit
   , planRemoval
   , planRemovalWith
+  , planNarrowing
+  , planNarrowingWith
   , planDiscovery
   , planDiscoveryWith
   , planMaintenanceWith
@@ -163,13 +165,16 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column)
+import Hetoimasia.Terrain.Changes (Replacement)
 import Hetoimasia.Terrain.Coordinate (TileCoord)
+import Hetoimasia.Terrain.Shape (CornerMask)
 import Hetoimasia.Terrain.Discovery
   ( Allowance (..)
   , Authority
   , Candidate
   , Env
   , Header (..)
+  , NarrowOutcome (NarrowRefused, NarrowStaged, NarrowSuspended)
   , Provider
   , ReadSet (..)
   , Record
@@ -181,12 +186,11 @@ import Hetoimasia.Terrain.Discovery
   , allowanceOf
   , candidateReport
   , envLimits
+  , stageNarrowingTraced
   , stageRemovalTraced
   , stepDiscoveryTraced
   , worstEdgeReads
   , worstEdgeWrites
-  , worstEditReads
-  , worstEditWrites
   )
 import Data.Int (Int64)
 import qualified Hetoimasia.Terrain.Discovery as Discovery
@@ -476,6 +480,25 @@ planRemovalWith bounds env s win0 tile = withWindow s win0 $ \_ →
         (Right (EditSuspended key), rs) → suspendedReads bounds s fp win rs key
         (Right (Discovery.Staged cand), rs) → settleReads bounds fp win rs (planEditWith bounds s win cand)
 
+-- | Plan the narrowing of one cell to a corner mask with its connection obligation, as one candidate: the run holding the
+-- cell is split and the neighbours that carry the same payload are coalesced, the void the cell held is joined to the new one,
+-- and the obligation to inspect its faces is written with them. It is one atomic edit, and a cell that is not a narrowing (air,
+-- a mask that is not a strict subset of the cell's corners, or a cell the target equals) is 'NoWork'. A target of mask 0 is the
+-- removal of the cell. Its read phase and its bounds are the removal's ('planRemovalWith'), over the larger figures
+-- ('maxEditWrites', 'maxEditReads') of an edit in a history that holds narrowed cells.
+planNarrowing ∷ Env → Store → Window → TileCoord → CornerMask → Planned
+planNarrowing = planNarrowingWith standardBounds
+
+-- | 'planNarrowing' under given bounds.
+planNarrowingWith ∷ Bounds → Env → Store → Window → TileCoord → CornerMask → Planned
+planNarrowingWith bounds env s win0 tile target = withWindow s win0 $ \_ →
+  let (fp, win, prov) = readPhase s win0
+   in case stageNarrowingTraced env (rHeader (sRoots s)) prov (readCapped bounds (editAllowance env)) tile target of
+        (Left refusal, _) → Refused (refusalOf refusal)
+        (Right NarrowRefused, _) → NoWork
+        (Right (NarrowSuspended key), rs) → suspendedReads bounds s fp win rs key
+        (Right (NarrowStaged cand), rs) → settleReads bounds fp win rs (planEditWith bounds s win cand)
+
 -- | The window as the read phase of a plan sees it (its read facts kept only for this very state), its fingerprint, and the
 -- provider over it: the facts first, then the pages.
 readPhase ∷ Store → Window → (Fingerprint, Window, Provider)
@@ -531,18 +554,20 @@ planDiscovery = planDiscoveryWith standardBounds
 planDiscoveryWith ∷ Bounds → Env → Store → Window → Planned
 planDiscoveryWith bounds env s win0 = withWindow s win0 $ \_ →
   let (fp, win, prov) = readPhase s win0
-   in go fp win prov (min (allowWrites full) (windowWorkAtLeast discoveryUnitWrites win0)) (8 ∷ Int)
+   in go fp win prov (min (allowWrites full) (windowWorkAtLeast discoveryUnitWrites win0))
   where
     full = allowanceOf (envLimits env)
-    go fp win prov writes tries =
+    go fp win prov writes =
       case stepDiscoveryTraced env (rHeader (sRoots s)) prov (readCapped bounds full) {allowWrites = writes} of
         (Left refusal, _) → Refused (refusalOf refusal)
         (Right Idle, _) → NoWork
         (Right (Stalled key), rs) → suspendedReads bounds s fp win rs key
         (Right (Progress cand _), rs) → case settleReads bounds fp win rs (planDeltaPinned bounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s) win Ordinary (deltaOf cand)) of
           Refused why
-            | tries > 0 && tooBig why && reportWrites (candidateReport cand) > discoveryUnitWrites →
-                go fp win prov (max discoveryUnitWrites (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
+            -- a smaller batch is taken only through a CHECKPOINT that publishes the reduced allowance ('FactChunk': the work limit of the window)
+            -- and releases the memos the window held, and the next call plans it in that fresh window (the reads it made are carried as facts)
+            | tooBig why && reportWrites (candidateReport cand) > discoveryUnitWrites →
+                Checkpoint (Facts fp [FactChunk (max discoveryUnitWrites (reportWrites (candidateReport cand) `div` 2))] noReadFacts)
           other → other
     tooBig = shrinkable
 
@@ -853,6 +878,7 @@ readOutcome (Left (Bad err p)) = ReadCorrupt (BadPage err p)
 readOutcome (Left (TooTall t)) = ReadCorrupt (BrokenInvariant t)
 readOutcome (Left (Invariant t)) = ReadCorrupt (BrokenInvariant t)
 readOutcome (Left (Over _)) = ReadCorrupt CorruptCounters
+readOutcome (Left (MemoOver _)) = ReadCorrupt CorruptCounters
 
 -- | Run a read against a pinned version, refusing a dead token and a window of another
 -- store or version before any page is read.
@@ -867,8 +893,8 @@ withPins s tok win f = case pinsOf s tok of
 readerLookup ∷ Store → ReaderToken → Window → RecordKey → ReadOutcome (Maybe Record)
 readerLookup s tok win key = withPins s tok win (\p → lookupRecord (pinView p win) (rootsOfPins p) key)
 
--- | The pinned removed run of a column at or below a level.
-readerFloorRun ∷ Store → ReaderToken → Window → Column → Int64 → ReadOutcome (Maybe (Int64, Int64))
+-- | The pinned replacement run of a column at or below a level: its two ends and its payload.
+readerFloorRun ∷ Store → ReaderToken → Window → Column → Int64 → ReadOutcome (Maybe (Int64, Int64, Replacement))
 readerFloorRun s tok win col z = withPins s tok win (\p → floorRun (pinView p win) (rootsOfPins p) col z)
 
 -- | A bounded ordered read of one record tree from a start (a key, or strictly after
@@ -1019,7 +1045,7 @@ data Counterexample = Counterexample
 -- | The most RAM the minimum explicit removal reserves: a full window, its pages and
 -- the control records.
 minimumRemovalRam ∷ Int
-minimumRemovalRam = removalRamWith worstEditWrites worstEditReads minimumRemovalPages
+minimumRemovalRam = removalRamWith maxEditWrites maxEditReads minimumRemovalPages
 
 -- | The RAM the smallest unit of discovery (one connection inspection: 'worstEdgeWrites' writes, 'worstEdgeReads' reads) reserves,
 -- by the same account: a full window, its pages, the control records and the read facts it retains.

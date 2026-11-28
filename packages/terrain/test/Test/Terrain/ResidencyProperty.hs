@@ -451,7 +451,7 @@ limitsOf (resident, staging, jobs) =
   either (const Nothing) Just . mkLimits $
     LimitsSpec
       { specResidentBytes = resident
-      , specEditBytes = 192
+      , specEditBytes = 216
       , specStagingBytes = staging
       , specLoadJobs = jobs
       , specQueuedCommands = 3
@@ -848,13 +848,13 @@ minimumBudgetsAreEnforced (resident, edit, staging, jobs) (query, x, y, z) =
       stored = 256 + 48 * columns + 35 * columns * z
       job = 48 * columns + 100 * intervals
       -- a frame, four bytes a (decoded) cell, and the runs a load reads of every column it touches over the
-      -- extent's z levels: at most z / 2 + 1 of 16 bytes, and a 48-byte entry, a column
-      scratch = 256 + 4 * columns * z + columns * ((z `div` 2 + 1) * 16 + 48)
+      -- extent's z levels: a run of 24 bytes for each level at the most, and a 48-byte entry, a column
+      scratch = 256 + 4 * columns * z + columns * (z * 24 + 48)
       needResident = maximum [4 * stored, stored + job] + maximum [query * (stored + job), stored + 48 + 100 + 66]
-      needStaging = maximum [64 * 4, 192 + 64 + scratch] + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 544 + 64 + 256 + 4 * z + (z `div` 2 + 1) * 16 + 48, stored]
+      needStaging = maximum [64 * 4, 192 + 64 + scratch] + maximum [128 + 32 * query + 64 * query + query * scratch, 160 + 576 + 64 + 256 + 4 * z + z * 24 + 48, stored]
       expected
         | resident < needResident = Just (BankBelowMinimum ResidentBank needResident resident)
-        | edit < 64 = Just (BankBelowMinimum EditBank 64 edit)
+        | edit < 72 = Just (BankBelowMinimum EditBank 72 edit)
         | staging < needStaging = Just (BankBelowMinimum StagingBank needStaging staging)
         | otherwise = Nothing
    in counterexample (show (spec', expected)) $ case (mkLimits spec', expected) of
@@ -928,7 +928,7 @@ spec = describe "Residency model properties" $ do
           Just limits → keptPrefixIsOrdinary limits seeds
   it "admits every stored region of a camera demand that fits an empty camera share, by Service and acknowledgements alone" $
     withNumTests 2000 $
-      forAll ((,) <$> chooseInteger (6400, 9000) <*> chooseInteger (2400, 4000)) $ \(resident, staging) → forAll (vectorOf 4 pair) $ \picks → storedDemandCompletes resident staging picks
+      forAll ((,) <$> chooseInteger (6400, 9000) <*> chooseInteger (2800, 4400)) $ \(resident, staging) → forAll (vectorOf 4 pair) $ \picks → storedDemandCompletes resident staging picks
   it "never reserves more for an explicit request than the construction-time worst case" $
     withNumTests 2000 $
       forAll (vectorOf 3 pair) reservationWithinMinimum

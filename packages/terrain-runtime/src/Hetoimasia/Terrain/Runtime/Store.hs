@@ -11,7 +11,7 @@
 -- == Using it
 --
 -- @
--- plan <- 'planRemoval' env store window tile        -- or 'planDiscovery', 'planMaintenance'
+-- plan <- 'planRemoval' env store window tile        -- or 'planNarrowing', 'planDiscovery', 'planMaintenance'
 -- case plan of
 --   'Pending' page   -> fetch the page, 'addPage' it to the window, plan again
 --   'PendingProbes' pages -> fetch each page, 'addProbe' it to the window (it may not be a page
@@ -157,6 +157,7 @@ module Hetoimasia.Terrain.Runtime.Store
   , IntegrityWhy (..)
   , planEdit
   , planRemoval
+  , planNarrowing
   , planDiscovery
   , planMaintenance
   , WindowRefusal (..)

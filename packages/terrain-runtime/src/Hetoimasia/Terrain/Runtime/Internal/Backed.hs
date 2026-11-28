@@ -92,7 +92,7 @@ import Data.Maybe (isJust)
 import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Terrain.Cell (Column (..), mkZRange)
-import Hetoimasia.Terrain.Changes (ChangeLimits (..), Changes, changeColumnBytes, changeIntervalBytes, changesFromIntervals)
+import Hetoimasia.Terrain.Changes (ChangeLimits (..), Changes, changeColumnBytes, changesFromReplacements, replacementRunBytes)
 import qualified Hetoimasia.Terrain.Query as Q
 import Hetoimasia.Terrain.Segment (decodedCellBytes, maxSegmentLevels, maxSegmentPayloadBytes)
 import qualified Hetoimasia.Terrain.Connectivity as C
@@ -138,11 +138,11 @@ import qualified Hetoimasia.Terrain.Runtime.Storage.Internal.Service as Storage
 import Hetoimasia.Terrain.Runtime.Storage.Internal.Types (IoFailure (..), IoOp (..), WorkClass (..))
 import qualified Hetoimasia.Terrain.Runtime.Store.Internal.Admission as A
 import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Admission)
-import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..), maxLevel)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageNo, StoreIdentity (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (ActiveView (..), Condition (..), GrowthProposal, Store, activeView, storeConfig, TxnId, conditions, oldestPin, pauseFor, storeFromRoots, storeHeader, storeRoots, storeVersion)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Plan, RamCharge (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (discoveryPlanner, maintenancePlanner, removalPlanner)
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders, windowPageBytes)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (Roots (..), StoreConfig, emptyRoots, maxReaders, readStepPages, windowPageBytes)
 import Hetoimasia.Terrain.Source (Source)
 
 -- ---------------------------------------------------------------------------
@@ -172,7 +172,7 @@ gathersPerArena config = fromInteger (min (toInteger maxReaders) (A.ebsReadersPe
 -- at its bound: the decoded segment of its cell's column in its region ('decodedCellBytes' a cell over a
 -- segment's levels), its rebuilt copy (a segment's worst-case payload, 'maxSegmentPayloadBytes'), the staged overlay (what its preparation keeps: the changes
 -- read over the cell and its two neighbours, at most four runs of one column, and the working
--- interval, one run) and the result settlement (a settled result's record).
+-- run, one, each at the tagged run's figure 'replacementRunBytes') and the result settlement (a settled result's record).
 removalStagingParts ∷ [(Text, Integer)]
 removalStagingParts =
   [ ("decoded segment", decoded)
@@ -184,7 +184,7 @@ removalStagingParts =
     decoded = toInteger decodedCellBytes * toInteger maxSegmentLevels
     rebuilt = toInteger maxSegmentPayloadBytes
     column = toInteger changeColumnBytes
-    interval = toInteger changeIntervalBytes
+    interval = toInteger replacementRunBytes
 
 -- | The parts of a removal's staging fit the staging it reserves: refused at construction otherwise,
 -- so the constant cannot drift below what it holds.
@@ -215,7 +215,7 @@ internalTurn = 3
 
 changeLimitsOf ∷ Config → ChangeLimits
 changeLimitsOf config =
-  ChangeLimits (fromInteger (min (toInteger (maxBound ∷ Int)) (toInteger (R.limitBytes (configLimits config) R.EditBank `div` 16))))
+  ChangeLimits (fromInteger (min (toInteger (maxBound ∷ Int)) (toInteger (R.limitBytes (configLimits config) R.EditBank `div` fromIntegral replacementRunBytes))))
 
 -- | What the owner supplies to the steps here: its staging (which tells the host), and its end
 -- with a defect (which records it and reaches supervision).
@@ -273,13 +273,15 @@ putStore aid store st =
     , stateClosing = Map.adjust (\c → c {closingStore = store}) aid (stateClosing st)
     }
 
--- | The removals a gather read, as the pure terrain model's changes.
-changesOfRuns ∷ Config → [(Column, Int64, Int64)] → Either Text Changes
-changesOfRuns config runs = do
-  intervals ← traverse interval runs
-  either (Left . Text.pack . show) Right (changesFromIntervals (changeLimitsOf config) intervals)
+-- | The replacements a gather read, air or a corner mask, as the pure terrain model's changes.
+changesOfRuns ∷ Config → [GatherRun] → Either Text Changes
+changesOfRuns _ runs = do
+  replacements ← traverse replacement runs
+  -- the read was funded for exactly these runs (its cap held at every step), and coalescing never adds one:
+  -- the bound is theirs, not the edit staging's
+  either (Left . Text.pack . show) Right (changesFromReplacements (ChangeLimits (length runs)) replacements)
   where
-    interval (column, lo, hi) = either (Left . Text.pack . show) (\r → Right (column, r)) (mkZRange (toInteger lo) (toInteger hi))
+    replacement (column, lo, hi, tag) = either (Left . Text.pack . show) (\r → Right (column, r, tag)) (mkZRange (toInteger lo) (toInteger hi))
 
 -- ---------------------------------------------------------------------------
 -- Pause
@@ -602,7 +604,7 @@ initialStore config aid ident cfg =
 data Gathered
   = -- | Every run of the columns, read from one committed version, with that version's
     -- content revision.
-    GatheredRuns ![(Column, Int64, Int64)] !Revision !(Int, Int, Int, [(Column, Int64, Int64)])
+    GatheredRuns ![GatherRun] !Revision !(Int, Int, Int, [(Column, Int64, Int64)])
   | -- | What is known of the cell, read from one committed version, with its content and knowledge revisions.
     GatheredKnowledge !D.CellKnowledge !Revision !Revision
   | -- | A retry's probe: the conditions it was for, and whether every recorded page read back as it must.
@@ -660,7 +662,7 @@ startGatherFor svc key aid what = do
 
 -- | WHAT A READ KEEPS IS CONTAINED IN ITS PIN CREDIT: a gather that may keep @cap@ runs of @columns@
 -- columns pins at most the reader's pin credit less those runs' bytes (by "Hetoimasia.Terrain.Changes"'s
--- figures), in window pages, so its pinned pages and its kept runs never pass the one credit it holds
+-- tagged-run figures), in window pages, so its pinned pages and its kept runs never pass the one credit it holds
 -- for its whole life. A load ('maxBound') keeps its runs in the scratch its job reserves: it pins the
 -- whole credit.
 keptPinLimit ∷ Int → Int → Int
@@ -670,22 +672,20 @@ keptPinLimit cap columns
 
 -- | The bytes @cap@ runs of @columns@ columns hold, at most.
 keptRunsBytes ∷ Int → Int → Int
-keptRunsBytes cap columns = cap * changeIntervalBytes + columns * changeColumnBytes
-
--- | The pages one step of a ranged read needs in its window: a path from the root to a leaf (the tree is
--- at most 'maxLevel' + 1 levels) and the next leaf, when the range crosses into it.
-readStepPages ∷ Int
-readStepPages = maxLevel + 2
+keptRunsBytes cap columns = cap * replacementRunBytes + columns * changeColumnBytes
 
 -- | The query limits leave every read kind the pages one read step needs beside what it keeps: the
 -- worst kind (a column query, or a surface's window, over the range limit: 'rangeKeep' of it) is
 -- refused at construction otherwise.
 queryKeepChecked ∷ Config → Either ConfigError ()
 queryKeepChecked config
-  | keptPinLimit worst 1 < readStepPages = Left (ConfigQueryKeep (toInteger (keptRunsBytes worst 1)) (toInteger (fromIntegral A.readerPinnedCacheBytes - readStepPages * windowPageBytes)))
+  | kept > allowed = Left (ConfigQueryKeep kept allowed)
   | otherwise = Right ()
   where
-    worst = rangeKeep 0 (fromIntegral (Q.limitRangeLevels (configQueryLimits config)))
+    -- in 'Integer': the public range limit is never multiplied in a fixed width, and the load's
+    -- unbounded cap is not this check's
+    kept = max 0 (toInteger (Q.limitRangeLevels (configQueryLimits config))) * toInteger replacementRunBytes + toInteger changeColumnBytes
+    allowed = toInteger A.readerPinnedCacheBytes - toInteger readStepPages * toInteger windowPageBytes
 
 -- | One step of a pinned read. When it ends, its pin and credit are released in the transaction
 -- that removes it, and then its owner is given the result.

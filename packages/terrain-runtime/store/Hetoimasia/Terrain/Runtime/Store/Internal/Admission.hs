@@ -184,9 +184,17 @@ data EditBankError
     CacheBelowNeed !Integer !Integer
   deriving stock (Eq, Show)
 
--- | The cache bytes one reader may hold pinned: 32 decoded pages.
+-- | The pages one reader may pin and the replacement runs it may keep, as cache bytes: 112 decoded pages. A ranged read may
+-- keep a run for each level of its range (runs of different tags alternate), so the credit holds the widest range the service
+-- accepts (12,288 levels of 24-byte runs and the column's entry, 294,960 bytes: 'readerKeptPages', 69) beside the pages one
+-- read step holds ('readStepPages': 43, two landings of a path and two neighbouring paths each, the root shared). The default
+-- range of 8,192 levels keeps 196,656 bytes and leaves 283,600.
 readerPinnedCacheBytes ∷ Word64
-readerPinnedCacheBytes = 32 * fromIntegral windowPageBytes
+readerPinnedCacheBytes = fromIntegral ((readerKeptPages + readStepPages) * windowPageBytes)
+
+-- | The pages the runs of the widest range the service accepts take in a reader's credit (294,960 bytes, rounded up).
+readerKeptPages ∷ Int
+readerKeptPages = 69
 
 -- | The most RAM one transaction can reserve at the format's bounds, by component.
 worstTransactionCharge ∷ RamCharge

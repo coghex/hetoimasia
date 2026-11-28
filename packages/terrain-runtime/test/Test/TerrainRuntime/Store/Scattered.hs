@@ -12,18 +12,19 @@
 module Test.TerrainRuntime.Store.Scattered (spec, fullSpec, scattered, fragmented) where
 
 import qualified Data.ByteString as BS
+import Data.ByteString.Short (toShort)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import Control.Monad (forM, forM_)
 import Data.Word (Word64)
-import Hetoimasia.Terrain.Discovery (Record, RecordKey)
+import Hetoimasia.Terrain.Discovery (ReadSet (..), Record, RecordKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeFree, encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, noReadFacts, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), Stop (..), factBytesOf, limitWork, memoListCellBytes, newEdit, runM, useMemoM, withMemoCap, memoBaseBytes, memoBoundBytes, windowInsert, windowMemoBytes, windowProbe, windowWork, noReadFacts, windowCheckpoint, windowFactCount, windowReadFactCount, packReads, windowFactsFor, windowKnows)
 import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
@@ -75,7 +76,16 @@ forgedProgress ∷ Int → (H, [RecordKey], Map.Map RecordKey Record)
 forgedProgress done = scatteredWith False (Just (done, True)) False
 
 scatteredWith ∷ Bool → Maybe (Int, Bool) → Bool → (H, [RecordKey], Map.Map RecordKey Record)
-scatteredWith frag fin noTail = (h, firstKeys, ref)
+scatteredWith = scatteredWithTall False
+
+-- | The fragmented layout with an ALLOCATOR TREE OF TWO LEVELS: every fourth page of the retired groups is a free page of its own (a free extent
+-- of one page, 3,645 of them in 19 leaves under a root), so a retired page that maintenance frees lands between them, and the pages of one
+-- chunk land in leaves of their own, each with neighbours a lookup memoises.
+fragmentedTall ∷ (H, [RecordKey], Map.Map RecordKey Record)
+fragmentedTall = scatteredWithTall True True Nothing False
+
+scatteredWithTall ∷ Bool → Bool → Maybe (Int, Bool) → Bool → (H, [RecordKey], Map.Map RecordKey Record)
+scatteredWithTall tall frag fin noTail = (h, firstKeys, ref)
   where
     -- the links tree: the records sorted by their encoded keys, 40 to a leaf
     recs = sortOn fst [(encodeKey k, (k, encodeValue a, a)) | i ← [0 .. leavesN * perLeaf - 1], let (k, a, _) = linkOf i]
@@ -92,7 +102,9 @@ scatteredWith frag fin noTail = (h, firstKeys, ref)
         start i = sum [len j | j ← [0 .. i - 1]]
     -- the page space: groups of 54 retired pages, each followed by one live leaf of the links tree
     leafPageNo j = fromIntegral (j * (groupN + 1) + groupN) ∷ Word64
-    retiredNos = [fromIntegral p ∷ Word64 | p ← [0 .. leavesN * (groupN + 1) - 1], p `mod` fromIntegral (groupN + 1) /= fromIntegral groupN]
+    slots = [fromIntegral p ∷ Word64 | p ← [0 .. leavesN * (groupN + 1) - 1], p `mod` fromIntegral (groupN + 1) /= fromIntegral groupN]
+    retiredNos = [p | p ← slots, not (tall && p `mod` 4 == 2)]
+    freeSingles = [p | tall, p ← slots, p `mod` 4 == 2]
     retiredCount = length retiredNos
     base = fromIntegral (leavesN * (groupN + 1)) ∷ Word64
     -- links tree pages: leaves, then 5 internal pages of 54 and the root, at the top of the space
@@ -123,14 +135,14 @@ scatteredWith frag fin noTail = (h, firstKeys, ref)
     versionOf p = maximum (0 : [v | (v, ps, _) ← entries, p `elem` ps]) ∷ Word64
     indexRecs = [(retiredKey (PageNo p), be64 (versionOf p)) | p ← retiredNos]
     -- the retirement tree: leaves of 54 index records (the first also holds the 29 entries)
-    idxGroups = chunk groupN indexRecs
+    idxGroups = if tall then balanced 60 indexRecs else chunk groupN indexRecs
     idxLeafRecs = case idxGroups of
       (g0 : gs) → (versionRecs ++ g0) : gs
       [] → []
     retireLeafBase = listBase + fromIntegral nLists
     retireLeaves = [Page TreeRetire 0 (PageNo (retireLeafBase + fromIntegral n)) (Leaf rs) | (n, rs) ← zip [0 ∷ Int ..] idxLeafRecs]
     retireInnerBase = retireLeafBase + fromIntegral (length retireLeaves)
-    retireInners = [Page TreeRetire 1 (PageNo (retireInnerBase + fromIntegral n)) (Inner [(firstKeyOf pg, childOf pg) | pg ← grp]) | (n, grp) ← zip [0 ∷ Int ..] (if frag then balanced 60 retireLeaves else chunk 136 retireLeaves)]
+    retireInners = [Page TreeRetire 1 (PageNo (retireInnerBase + fromIntegral n)) (Inner [(firstKeyOf pg, childOf pg) | pg ← grp]) | (n, grp) ← zip [0 ∷ Int ..] (if frag then balanced (if tall then 70 else 60) retireLeaves else chunk 136 retireLeaves)]
     retireRoot = Page TreeRetire 2 (PageNo (retireInnerBase + fromIntegral (length retireInners))) (Inner [(firstKeyOf pg, childOf pg) | pg ← retireInners])
     usedHw = retireInnerBase + fromIntegral (length retireInners) + 1
     -- the free extent of the fragmented layout: 256 pages past the used space of the rest, each an old version of a
@@ -138,14 +150,19 @@ scatteredWith frag fin noTail = (h, firstKeys, ref)
     extentPages = [Page TreeLinks 0 (PageNo (usedHw + fromIntegral i)) (Leaf [(k, v) | (k, (_, v, _)) ← take 1 lr]) | (i, lr) ← [(i, leafRecs !! ((4 * i + 2) `mod` leavesN)) | i ← [0 .. 255]]]
     extentLen = if noTail then cfgUsablePages (hCfg h0) - usedHw - 1 else 256
     freeLeaf = Page TreeFree 0 (PageNo (usedHw + extentLen)) (Leaf [encodeFree usedHw extentLen])
-    livePagesList = linkLeaves ++ linkInners ++ [linkRoot] ++ listPages ++ retireLeaves ++ retireInners ++ [retireRoot] ++ [freeLeaf | frag]
+    -- the tall allocator tree: leaves of nearly 200 extents (each at least a quarter of a payload) and a root over them
+    tallLeaves = [Page TreeFree 0 (PageNo (usedHw + extentLen + fromIntegral i)) (Leaf (map (uncurry encodeFree) grp)) | (i, grp) ← zip [0 ∷ Int ..] (balanced 200 ([(q, 1) | q ← freeSingles] ++ [(usedHw, extentLen)]))]
+    tallRoot = Page TreeFree 1 (PageNo (usedHw + extentLen + fromIntegral (length tallLeaves))) (Inner [(firstKeyOf pg, childOf pg) | pg ← tallLeaves])
+    freeTreePages = if tall then tallLeaves ++ [tallRoot] else [freeLeaf]
+    freeRootPage = if tall then tallRoot else freeLeaf
+    livePagesList = linkLeaves ++ linkInners ++ [linkRoot] ++ listPages ++ retireLeaves ++ retireInners ++ [retireRoot] ++ (if frag then freeTreePages else [])
     -- a retired page of a legitimate store holds the old version of a record-tree page (maintenance refuses anything else)
     oldPages = [Page TreeLinks 0 (PageNo q) (Leaf [(k, v) | (k, (_, v, _)) ← take 1 (leafRecs !! oldLeaf q)]) | q ← retiredNos]
     oldLeaf q = case lookup q (zip oldest [0 ∷ Int ..]) of
       Just i → (4 * i + 1) `mod` leavesN
       Nothing → fromIntegral q `mod` leavesN
     writtenPages = livePagesList ++ (if frag then extentPages else []) ++ (if frag || fin /= Nothing then oldPages else [])
-    hw = if frag then usedHw + extentLen + 1 else usedHw
+    hw = if frag then usedHw + extentLen + fromIntegral (length freeTreePages) else usedHw
     h0 = newH (specOf (128 * 1024 * 1024) Nothing) ident0
     disk = foldl (\dk pg → diskWrite (pgNo pg) (either (error . show) id (encodePage ident0 pg)) dk) (hDisk h0) writtenPages
     roots0 = storeRoots (hStore h0)
@@ -157,9 +174,9 @@ scatteredWith frag fin noTail = (h, firstKeys, ref)
         , rHw = hw
         , rLivePages = fromIntegral (length livePagesList)
         , rRetiredPages = fromIntegral retiredCount
-        , rRootCrcs = [(TreeLinks, crcOf linkRoot), (TreeRetire, crcOf retireRoot)] ++ [(TreeFree, crcOf freeLeaf) | frag]
-        , rFree = if frag then Just (pgNo freeLeaf) else Nothing
-        , rFreePages = if frag then extentLen else 0
+        , rRootCrcs = [(TreeLinks, crcOf linkRoot), (TreeRetire, crcOf retireRoot)] ++ [(TreeFree, crcOf freeRootPage) | frag]
+        , rFree = if frag then Just (pgNo freeRootPage) else Nothing
+        , rFreePages = if frag then extentLen + fromIntegral (length freeSingles) else 0
         }
     h = h0 {hStore = storeFromRoots (hCfg h0) ident0 roots, hDisk = disk}
 
@@ -400,6 +417,71 @@ specAtOnce depth = describe "round 13: the window a unit of work holds at once, 
       case q of
         Planned pl → (mWindowPages (plMeasure pl) <= lim0) `shouldBe` True
         other → expectationFailure ("no progress after the readers released, window " <> show lim0 <> ": " <> take 300 (show other))
+  it "meets the memo budget of a reclamation chunk with a smaller chunk after the larger one has checkpointed, on an allocator tree of two levels" $ do
+    -- the pages of a chunk land between the free extents of 19 leaves; each landing memoises the two chains beside its leaf; in a window of the
+    -- unit of one page the memos are carried through checkpoints, and a budget of room for a dozen of them is passed by the chunk of 64 part
+    -- way. The memo budget is met as the shrinkable 'TxnRamExceeded', so the plan takes the next smaller chunk from a ledger that holds none of
+    -- the larger one's memos: it frees fewer pages, and some, where the wide budget frees 64
+    let (h0, _, _) = fragmentedTall
+        hr = heightOf h0 TreeRetire
+        hf = max 1 (heightOf h0 TreeFree)
+        hrec = max 1 (maximum [heightOf h0 t | t ← [TreeRuns, TreeLinks, TreeTodo]])
+        bounded n = standardBounds {bdWindowPages = n, bdWindowBytes = n * windowPageBytes}
+        room = 12 * (memoBaseBytes + 2 * memoBoundBytes 8)
+        work = limitWork 64 (storeWindow (hStore h0))
+        planned bounds = case fillCounting h0 work (planMaintenanceWith bounds (hStore h0)) of
+          Right (Planned pl, _, _, _) → mFreed (plMeasure pl) == 64
+          _ → False
+        -- the smallest window the whole chunk of 64 still plans in: its memos must be carried through checkpoints
+        smallest n = if n > 2 && planned (bounded (n - 1)) then smallest (n - 1) else n
+        lim = smallest (max 16 (workOneWindowPages hr hf hrec 0 + 200) `max` 64)
+        windowed = bounded lim
+    heightOf h0 TreeFree `shouldBe` 2
+    -- the store is a valid one (the free tree and the retirement index at their minimum fill, counters agreeing), whatever the chunks do
+    must (checkH h0)
+    (wide, _, _, _) ← must (fillCounting h0 work (planMaintenanceWith windowed (hStore h0)))
+    (narrow, _, _, cps) ← must (fillCounting h0 work (planMaintenanceWith windowed {bdMemoBytes = room} (hStore h0)))
+    case (wide, narrow) of
+      (Planned a, Planned b) → do
+        let freedWide = mFreed (plMeasure a)
+            freedNarrow = mFreed (plMeasure b)
+        printLine ("MEMO budget at a reclamation chunk on a two-level allocator: freed " <> show freedWide <> " wide, " <> show freedNarrow <> " with room for 12 memos, " <> show cps <> " checkpoints")
+        (freedWide > 8, 0 < freedNarrow && freedNarrow < freedWide, cps > 0) `shouldBe` (True, True, True)
+        -- THE WORK LIMIT ACROSS PLANNER CALLS, in the smallest window the smaller chunk plans in (so that it must itself checkpoint): each call
+        -- of the planner, the window it ran through and what it answered. The reduction is a checkpoint that publishes the reduced limit and
+        -- releases the memos the window held; a later checkpoint is taken while the reduced limit is active; the plan resumed from it succeeds
+        let planNarrow n = fillCounting h0 work (planMaintenanceWith ((bounded n) {bdMemoBytes = room}) (hStore h0))
+            freedAt n = case planNarrow n of
+              Right (Planned pl, _, _, _) → Just (mFreed (plMeasure pl))
+              _ → Nothing
+            smallestNarrow n = if n > 2 && freedAt (n - 1) /= Nothing then smallestNarrow (n - 1) else n
+            limNarrow = smallestNarrow lim
+            boundsNarrow = (bounded limNarrow) {bdMemoBytes = room}
+            total = cfgUsablePages (hCfg h0)
+            fetch p = maybe BS.empty id (diskRead (hDisk h0) p)
+            trace w calls (n ∷ Int)
+              | n > 20000 = Left "planning did not settle"
+              | otherwise = case planMaintenanceWith boundsNarrow (hStore h0) w of
+                  Pending p → case diskRead (hDisk h0) p of
+                    Just bs → either (Left . show) (\w' → trace w' calls (n + 1)) (windowInsert total p bs w)
+                    Nothing → Left "missing page"
+                  PendingProbes ps → trace (foldl (\w' p → windowProbe total p (fetch p) w') w ps) calls (n + 1)
+                  Checkpoint facts@(Facts _ fs _) →
+                    let w' = windowCheckpoint facts w
+                        reduced = not (null [() | FactChunk _ ← fs])
+                     in trace w' ((windowWork w, windowWork w', reduced, windowMemoBytes w, windowMemoBytes w') : calls) (n + 1)
+                  other → Right (other, reverse calls)
+        (final, calls) ← must (trace work [] 0)
+        printLine ("MEMO budget, the work limit across planner calls (limit before, limit after, a reduction, memo bytes before, after): " <> show calls)
+        -- a reduction from a window that already holds memos: the limit falls, and the memos are released with the checkpoint
+        -- the FIRST reduction is the memo-budget one: it starts at the whole chunk of 64 with memos held and resumes at 32 with none
+        [(limBefore, limAfter, memosBefore > 0, memosAfter) | (limBefore, limAfter, True, memosBefore, memosAfter) ← take 1 [c | c@(_, _, True, _, _) ← calls]] `shouldBe` [(64, 32, True, 0)]
+        -- and a checkpoint taken while a reduced limit is active (not a reduction itself), which the resumed plan goes on from
+        [() | (limBefore, _, False, _, _) ← calls, limBefore < 64] `shouldSatisfy` (not . null)
+        case final of
+          Planned pl → (0 < mFreed (plMeasure pl), mFreed (plMeasure pl) <= minimum [limAfter | (_, limAfter, _, _, _) ← calls]) `shouldBe` (True, True)
+          other → expectationFailure ("the resumed plan did not succeed: " <> take 200 (show other))
+      other → expectationFailure ("both plans were expected, got " <> take 300 (show other))
   it "answers the typed window result, never a checkpoint with no new fact, for every window too small to hold the edit and one proof" $ do
     let (h0, _, _) = fragmented
     -- every size from 3 pages up to past the at-once bound: planned, or the typed window result; never a loop of checkpoints
@@ -457,6 +539,49 @@ specFingerprint = describe "round 13: the facts a window carries are trusted onl
     -- facts proven against another state replace the ones a window carries, never merge with them
     let other = Facts fpAfter [FactUnreachable (PageNo 20)] noReadFacts
     windowFactCount (windowCheckpoint other w1) `shouldBe` 1
+
+  it "knows the memo of a chain for the tree it was made in: the same page, checksum and bounds under another tree is not known" $ do
+    -- the todo and the free trees both use eight-byte keys, so their bounds can coincide, and a corrupt child reference may name a page one
+    -- of them has already read: only the tree in the memo says the page was checked as a page of THIS tree
+    let (h0, _, _) = fragmented
+        fp = fingerprintOf (hIdent h0) (storeRoots (hStore h0)) []
+        bound = Just (toShort (be64 7))
+        memo t = FactEdge t True (PageNo 5) 99 bound bound 0
+        w = windowCheckpoint (Facts fp [memo TreeTodo] noReadFacts) (storeWindow (hStore h0))
+    (windowKnows (memo TreeTodo) w, windowKnows (memo TreeFree) w, windowKnows (memo TreeLinks) w) `shouldBe` (True, False, False)
+
+  it "stops a plan whose first reuse of a carried memo would pass the memo budget, by the list cell the edit keeps for it" $ do
+    -- a checkpoint can hold exactly the budget; the edit's first use of a memo adds its list cell beside the window's set entry, which the
+    -- ledger charges, so the use is where the budget is checked: at the budget it stops as the shrinkable memo refusal, a cell above it plans
+    let (h0, _, _) = fragmented
+        fp = fingerprintOf (hIdent h0) (storeRoots (hStore h0)) []
+        bound = Just (toShort (be64 7))
+        memo = FactEdge TreeTodo True (PageNo 5) 99 bound bound 0
+        w = windowCheckpoint (Facts fp [memo] noReadFacts) (storeWindow (hStore h0))
+        at cap = fmap (const ()) (runM (useMemoM memo) (withMemoCap cap (newEdit 0 w)))
+    windowMemoBytes w `shouldBe` factBytesOf memo
+    at (factBytesOf memo) `shouldBe` Left (MemoOver (factBytesOf memo + memoListCellBytes))
+    at (factBytesOf memo + memoListCellBytes) `shouldBe` Right ()
+
+  it "releases ALL the state of an abandoned batch at a reduction, and only the memos it did not use at any other checkpoint" $ do
+    -- INVARIANT 2 at the one place every reduction goes through ('windowCheckpoint'): a window that holds a memo, a proof and a packed read, handed
+    -- a checkpoint that carries a reduced work limit, holds none of the three and the limit; handed any other checkpoint, it keeps the proof and
+    -- the read and releases the memo it did not use again
+    let (h0, firstKeys, _) = fragmented
+        roots = storeRoots (hStore h0)
+        fp = fingerprintOf (hIdent h0) roots []
+        bound = Just (toShort (be64 7))
+        memo = FactEdge TreeTodo True (PageNo 5) 99 bound bound 0
+        proof = FactUnreachable (PageNo 9)
+        key = firstKeys !! 0
+        readSet = ReadSet [(key, Nothing)] []
+        carrying = windowCheckpoint (Facts fp [memo, proof] (packReads readSet)) (limitWork 64 (storeWindow (hStore h0)))
+        held w = (windowMemoBytes w, windowKnows proof w, windowReadFactCount w, windowWork w)
+    held carrying `shouldBe` (factBytesOf memo, True, 1, 64)
+    -- a reduction: nothing is carried but the reduced limit
+    held (windowCheckpoint (Facts fp [FactChunk 8] noReadFacts) carrying) `shouldBe` (0, False, 0, 8)
+    -- any other checkpoint: the proof and the read stay, the unused memo goes
+    held (windowCheckpoint (Facts fp [FactNotIndexed (PageNo 11)] noReadFacts) carrying) `shouldBe` (0, True, 1, 64)
 
 -- | A sparse retirement tree is corruption, not a window result: a non-root page of the retirement tree below a quarter
 -- of a payload, re-sealed with every checksum above it, is refused when a plan descends to it; before the rule a

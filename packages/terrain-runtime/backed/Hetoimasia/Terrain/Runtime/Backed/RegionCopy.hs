@@ -74,11 +74,12 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Word (Word64, Word8)
 import Hetoimasia.Terrain.Cell (Cell (..), Column (..), ZRange, mkZRange, zRangeHi, zRangeLo)
-import Hetoimasia.Terrain.Changes (changeColumnBytes, changeIntervalBytes, emptyChanges, runsMeetingLevels)
+import Hetoimasia.Terrain.Changes (Replacement (..), changeColumnBytes, emptyChanges, replacementRunBytes, replacementRunsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate (RegionCoord (..), TileCoord (..), axisFromInteger, axisValue, decomposeTile)
 import qualified Hetoimasia.Terrain.Discovery as D
 import Hetoimasia.Terrain.Query (cellAt)
 import Hetoimasia.Terrain.Residency (ArenaId, Revision)
+import Hetoimasia.Terrain.Runtime.Backed.Gather (GatherRun)
 import Hetoimasia.Terrain.Source (Source)
 
 -- ---------------------------------------------------------------------------
@@ -192,10 +193,12 @@ workPerLevelEvaluations (RegionWork _ _ _ _ _ n) = n
 -- ---------------------------------------------------------------------------
 -- Packing
 
--- | Pack a region's removed runs (of its own columns, @[lo, hi)@, as read over its levels and one
--- beyond) clipped to its 32 levels: for each column with an interval, ascending by its local index
--- @y * 16 + x@, the index, the count and each interval's ends relative to the region's floor.
-packTerrain ∷ RegionCoord → [(Column, Int64, Int64)] → ShortByteString
+-- | Pack a region's removed runs (the air runs of its own columns, @[lo, hi)@, as read over its levels
+-- and one beyond) clipped to its 32 levels: for each column with an interval, ascending by its local
+-- index @y * 16 + x@, the index, the count and each interval's ends relative to the region's floor. The
+-- part is the removed-interval form: a run limited to a corner mask is not in it (its levels are
+-- occupied, and a copy's tagged replacements are a later change of the part's form).
+packTerrain ∷ RegionCoord → [GatherRun] → ShortByteString
 packTerrain region runs =
   SBS.pack . concat $
     [ fromIntegral index : fromIntegral (length intervals) : concat [[fromIntegral (lo - z0), fromIntegral (hi - z0)] | (lo, hi) ← intervals]
@@ -207,7 +210,7 @@ packTerrain region runs =
     byColumn =
       Map.map (sortOn fst) . Map.fromListWith (<>) $
         [ (localIndex, [(max z0 lo, min (z0 + 32) hi)])
-        | (Column x y, lo, hi) ← runs
+        | (Column x y, lo, hi, ReplaceAir) ← runs
         , let cx = axisValue x - x0
               cy = axisValue y - y0
               localIndex = cy * 16 + cx
@@ -327,19 +330,21 @@ shortBytes ∷ Int → Word64
 shortBytes n = objectBytes 1 + objectBytes 1 + wordBytes * ((fromIntegral n + 7) `div` 8)
 
 -- | The most one held region can hold: its entry, a terrain part of 256 columns each with the most
--- intervals 32 levels can hold (16: removed runs are coalesced, so two are a level apart), and a
+-- intervals 32 levels can hold (16: air runs are coalesced, so two are a level apart, whatever mask runs lie
+-- between them), and a
 -- knowledge part of 256 distinct classes each of 32 runs with the column map.
 worstRegionBytes ∷ Word64
 worstRegionBytes = regionEntryBytes + shortBytes (256 * (2 + 2 * 16)) + shortBytes (2 + 256 * (1 + 2 * 32) + 256)
 
--- | What one region's build keeps while it runs, at the package's accounted figures: the removed runs
--- its two reads keep and the same runs indexed for its plan (320 columns over 34 levels each), its
+-- | What one region's build keeps while it runs, at the package's accounted figures: the replacement runs
+-- its two reads keep and the same runs indexed for its plan (320 columns over 34 levels each, a run a level
+-- at the most), its
 -- plan's pieces (256 classes of at most 34) and its tiles and their answers (8,192 of each at most).
 buildScratchBytes ∷ Word64
 buildScratchBytes = 2 * runsBytes + pieceBytes + tileBytes
   where
     columns = 320
-    runsBytes = columns * fromIntegral (runsMeetingLevels (34 ∷ Int)) * fromIntegral changeIntervalBytes + columns * fromIntegral changeColumnBytes
+    runsBytes = columns * fromIntegral (replacementRunsMeetingLevels (34 ∷ Int)) * fromIntegral replacementRunBytes + columns * fromIntegral changeColumnBytes
     pieceBytes = 256 * 34 * 16
     tileBytes = 8192 * (32 + 16)
 

@@ -34,6 +34,17 @@ import Test.TerrainRuntime.Store.Reference
 must ∷ Either String a → IO a
 must = either (\e → expectationFailure e >> fail e) pure
 
+-- | The records a leaf of runs holds so that one deletion leaves it under the least a node may hold ('minNodeBytes'): derived from the encoded
+-- size of a run entry (its two length bytes, a 24-byte key and a 9-byte air value), so the leaf is just over the threshold.
+underfillLeaf ∷ Int
+underfillLeaf = minNodeBytes `div` (2 + 24 + 9) + 1
+
+-- | The pages the committed runs tree holds.
+runsTreePages ∷ H → Int
+runsTreePages h = length (twPages (walkTree a (siSource (hIdent h)) (diskRead (hDisk h)) ((\(PageNo p) → p) <$> committedRoot (hStore h) TreeRuns)))
+  where
+    ArenaId a = siArena (hIdent h)
+
 -- | A runs tree of three levels: leaves of @perLeaf@ records, one internal page per given child count, a root.
 -- The records of leaf @l@ are @leafKey l 1 .. leafKey l perLeaf@.
 deepStore ∷ Int → [Int] → (H, Map.Map RecordKey Record, [Int])
@@ -85,7 +96,7 @@ specAt depth = specDeletion depth >> specChurn depth >> specAdversarial depth >>
 specDeletion ∷ Depth → Spec
 specDeletion depth = describe "deletion against trees deep enough to merge and redistribute internal nodes" $ do
   it "redistributes two internal siblings whose combined entries do not fit one page (the round-10 case)" $ do
-    let (h, ref, _) = deepStore 30 [28, 90]
+    let (h, ref, _) = deepStore underfillLeaf [28, 90]
         key0 = fst (Map.findMin ref)
         entry = innerKeyBytes (encodeKey key0)
         combined = (28 + 90 - 1) * entry
@@ -99,9 +110,35 @@ specDeletion depth = describe "deletion against trees deep enough to merge and r
     h1 ← must (commitWrites h [(key0, Nothing)])
     must (checkH h1)
     must (compareRecords (Map.toList (Map.delete key0 ref)) h1)
+    -- the first leaf really merged into its sibling and the two internal pages redistributed their children instead of merging:
+    -- exactly one page fewer
+    runsTreePages h `shouldBe` runsTreePages h1 + 1
     -- the publication is the committed version: a fresh read agrees
     rRuns (storeRoots (hStore h1)) `shouldSatisfy` (/= rRuns (storeRoots (hStore h)))
-  forM_ (atDepth depth [(30 ∷ Int, [28, 90], 1 ∷ Word64)] [(30, [28, 90], 1), (30, [28, 28, 28, 28], 2), (30, [28, 90, 28, 60], 3), (40, [28, 90, 28, 100], 4)]) $ \(perLeaf, counts, seed) →
+  it "reads and replaces no more than 2 * height - 1 committed pages for one deletion, the cascading rebalance included" $ do
+    -- the round-10 case: the first leaf merges into its sibling and the first internal page redistributes with the second, so one
+    -- deletion reads and replaces two leaves, two internal pages and the root, all five of them indexed as retired
+    let (h, ref, _) = deepStore underfillLeaf [28, 90]
+        key0 = fst (Map.findMin ref)
+        total = cfgUsablePages (hCfg h)
+        height = heightOf h TreeRuns
+        replacedBy hh key = do
+          root ← maybe (Left "a runs root expected") Right (rootOf (storeRoots (hStore hh)) TreeRuns)
+          let go w (n ∷ Int) = case runM (deleteKey TreeRuns (Just (Disk root)) (encodeKey key)) (newEdit maxBound w) of
+                Right (_, e) → Right (length (editReplaced e))
+                Left (Need p) | n < 400 → case diskRead (hDisk hh) p of
+                  Just bs → either (Left . show) (\w' → go w' (n + 1)) (windowInsert total p bs w)
+                  Nothing → Left "missing page"
+                Left other → Left (show other)
+          go (storeWindow (hStore hh)) 0
+    height `shouldBe` 3
+    n0 ← must (replacedBy h key0)
+    (n0 <= worstReplacedPerWrite height, n0) `shouldBe` (True, 5)
+    -- and a deletion in the middle of the second leaf's parent, which neither merges nor redistributes, replaces its path alone
+    let mid = fst (Map.elemAt (Map.size ref `div` 2) ref)
+    nMid ← must (replacedBy h mid)
+    (nMid <= worstReplacedPerWrite height) `shouldBe` True
+  forM_ (atDepth depth [(underfillLeaf, [28, 90], 1 ∷ Word64)] [(underfillLeaf, [28, 90], 1), (underfillLeaf, [28, 28, 28, 28], 2), (underfillLeaf, [28, 90, 28, 60], 3), (40, [28, 90, 28, 100], 4)]) $ \(perLeaf, counts, seed) →
     it ("never refuses a legitimate deletion or reinsertion, and the checker agrees after every step (" <> show counts <> ", " <> show perLeaf <> " records a leaf)") $ do
       let (h0, ref0, _) = deepStore perLeaf counts
           original = ref0

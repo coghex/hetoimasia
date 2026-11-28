@@ -56,8 +56,8 @@ oracle m arena demands removal
     metadata = 256
     interest = 64
     growth = if removal then 66 else 0
-    removalStaging = if removal then 544 else 0
-    retainedBytes = 64
+    removalStaging = if removal then 576 else 0
+    retainedBytes = 72
     commandBytes = 128 + 32 * n
 
     regionOf d = case [r | r ← modelRegions m, regionArena r == arena, regionCoord r == demandRegion d] of
@@ -96,8 +96,8 @@ oracle m arena demands removal
             Nothing → 0
             -- a frame, four bytes for each cell it decodes (the whole segment each interval merges into: at most 32 per
             -- interval and the extent's levels per column), and the runs the load reads of every column it touches over the
-            -- extent's levels: at most levels / 2 + 1 runs of 16 bytes, and each column a 48-byte entry
-            Just nw → 256 + 4 * min (toInteger (coverageColumns nw) * extentLevels) (32 * toInteger (coverageSegments nw)) + toInteger (coverageColumns nw) * ((extentLevels `div` 2 + 1) * 16 + 48)
+            -- extent's levels: a run for each level at the most (tags alternate), 24 bytes each, and each column a 48-byte entry
+            Just nw → 256 + 4 * min (toInteger (coverageColumns nw) * extentLevels) (32 * toInteger (coverageSegments nw)) + toInteger (coverageColumns nw) * (extentLevels * 24 + 48)
        in (maybe 0 (toInteger . regionBytes) res, reserve, promisedLeast, scratch, isJust new)
     promisedCover d = case [jobCoverage j | j ← modelJobs m, jobArena j == arena, jobRegion j == demandRegion d, jobPhase j /= JobCancellingPhase] of
       [] → Nothing

@@ -119,7 +119,7 @@ import qualified Data.Text as Text
 import Data.Word (Word64)
 import Hetoimasia.Foundation.Failure (catchSTMRestarting)
 import Hetoimasia.Terrain.Cell
-import Hetoimasia.Terrain.Changes (Changes, changeColumnBytes, changeIntervalBytes, emptyChanges, runsMeetingLevels)
+import Hetoimasia.Terrain.Changes (Changes, Replacement (..), changeColumnBytes, emptyChanges, replacementRunBytes, replacementRunsMeetingLevels)
 import Hetoimasia.Terrain.Coordinate
 import qualified Hetoimasia.Terrain.Connectivity as C
 import qualified Hetoimasia.Terrain.Discovery as D
@@ -134,6 +134,7 @@ import Hetoimasia.Terrain.Resident (ResidentStats (..), columnIndexBytes, discar
 import Hetoimasia.Terrain.Segment (maxSegmentPayloadBytes)
 import Hetoimasia.Terrain.Runtime.Internal.Types
 import Hetoimasia.Terrain.Runtime.Backed.Fault (StorageFault)
+import Hetoimasia.Terrain.Runtime.Backed.Gather (GatherRun)
 import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (regionReservation)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Condition (..), GrowthDecision (..), conditions, proposeGrowth)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig)
@@ -380,10 +381,10 @@ commandRanges limits source surfaceWindow = \case
   CRetry → []
 
 -- | The most runs a read of these ranges keeps, by its kind: what its ranges can hold ('rangeKeep'), so
--- the cap never cuts a read short. A cell one, a removal two (its neighbours, which it coalesces with),
--- a column query up to 'limitRangeLevels' / 2 + 1, a surface's window likewise. NOT the returned-run
--- limit: removed runs that meet source air merge with it, so an answer may be far shorter than what its
--- read keeps. The others keep nothing ('maxBound': a load keeps its runs in its job's scratch, never in
+-- the cap never cuts a read short. A cell one, a removal three (its level and the two beside it), a column
+-- query up to 'limitRangeLevels', a surface's window likewise: runs of different tags may alternate at every
+-- level. NOT the returned-run limit: replaced runs that meet source air merge with it, so an answer may be far
+-- shorter than what its read keeps. The others keep nothing ('maxBound': a load keeps its runs in its job's scratch, never in
 -- its pin).
 keepCap ∷ [(Column, Int64, Int64)] → Cmd → Int
 keepCap ranges = \case
@@ -395,10 +396,11 @@ keepCap ranges = \case
   where
     held = sum [rangeKeep lo hi | (_, lo, hi) ← ranges]
 
--- | The most removed runs that meet the levels @[lo, hi)@ of one column: runs are coalesced, so two of
--- them are a level apart at least.
+-- | The most replacement runs that meet the levels @[lo, hi)@ of one column: runs are disjoint and
+-- adjacent runs may differ in tag, so there is one for each level at the most, the one holding the lowest
+-- level included.
 rangeKeep ∷ Int64 → Int64 → Int
-rangeKeep lo hi = fromIntegral (runsMeetingLevels (hi - lo))
+rangeKeep lo hi = fromIntegral (replacementRunsMeetingLevels (hi - lo))
 
 -- | The levels of a region a load may make resident (the configured extent's height), which a load
 -- reads of every column it touches.
@@ -410,9 +412,9 @@ extentLevels config = let (_, _, z) = R.limitExtent (configLimits config) in fro
 -- none). That stays true at any later revision: a source never changes and a change only removes. The
 -- levels above are given as one removed interval, so the highest occupied cell of the result is the
 -- surface's answer when it lies in the window.
-surfaceKnown ∷ Source → Column → Int64 → [(Column, Int64, Int64)] → [(Column, Int64, Int64)]
+surfaceKnown ∷ Source → Column → Int64 → [GatherRun] → [GatherRun]
 surfaceKnown source column hi runs = case Q.highestOccupied source emptyChanges column of
-  Just top | t ← axisValue (Q.occupiedLevel top) + 1, hi < t → (column, hi, t) : runs
+  Just top | t ← axisValue (Q.occupiedLevel top) + 1, hi < t → (column, hi, t, ReplaceAir) : runs
   _ → runs
 
 -- | The first window a surface reads, down from its source's top: one region's height.
@@ -946,9 +948,9 @@ jobWorkOfModel j = JobWork (R.jobId j) (R.jobArena j) (R.jobRegion j) (R.jobActi
 -- decision's value, which is also the input of the work itself) and the data layer's own
 -- sizes, not the model's cost functions: a column index entry is 'columnIndexBytes' (48), a
 -- segment is 32 bytes of metadata and at least two of payload (a uniform one), and the
--- scratch is a 256-byte frame, four bytes for each cell it decodes (the whole segment each interval merges into, at most 32 cells, and at most the extent's levels in a column: a decoded 32-bit cell), and the removed runs the job reads of its
--- columns (a column of l levels holds at most l / 2 + 1 runs: by "Hetoimasia.Terrain.Changes"'s
--- figures, (cells / 2 + columns) intervals and an entry a column).
+-- scratch is a 256-byte frame, four bytes for each cell it decodes (the whole segment each interval merges into, at most 32 cells, and at most the extent's levels in a column: a decoded 32-bit cell), and the replacement runs the job reads of its
+-- columns (a column of l levels holds at most l runs, alternating tags: by "Hetoimasia.Terrain.Changes"'s
+-- tagged-run figures, 24 bytes a run and an entry a column).
 startJobWork ∷ Service → R.JobId → R.Coverage → STM ()
 startJobWork svc jid cover =
   modifySt svc $ \st →
@@ -960,7 +962,7 @@ startJobWork svc jid cover =
     -- extent's levels in each column
     decoded = min (R.coverageColumns cover * extentLevels (serviceConfig svc)) (32 * R.coverageSegments cover)
     -- every column the job touches, over the region's loadable extent (what the job reads)
-    runs = R.coverageColumns cover * (runsMeetingLevels (extentLevels (serviceConfig svc)) * fromIntegral changeIntervalBytes + fromIntegral changeColumnBytes)
+    runs = R.coverageColumns cover * (replacementRunsMeetingLevels (extentLevels (serviceConfig svc)) * fromIntegral replacementRunBytes + fromIntegral changeColumnBytes)
 
 -- | The job's report (completed, failed or acknowledged) ends its record, in the
 -- transaction that reports it.

@@ -16,13 +16,13 @@ import qualified Data.ByteString as BS
 import qualified Data.Map.Strict as Map
 import Data.List (nub)
 import Data.Int (Int64)
-import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
+import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..), maxBatchUpdates)
 import Hetoimasia.Terrain.Residency (ArenaId (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
-import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Page (..), encodePage)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Page (..), decodePage, encodePage)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
-import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64, decodeKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree
 import Test.Hspec
@@ -114,8 +114,8 @@ spec = describe "pinned readers, retirement and reclamation" $ do
                 Nothing → Left "missing page"
               other → Left (show other)
         r ← must (go w0 0)
-        fmap fst r `shouldBe` Just lo
-        fmap snd r `shouldBe` Just (hiOf v)
+        fmap (\(l, _, _) → l) r `shouldBe` Just lo
+        fmap (\(_, h, _) → h) r `shouldBe` Just (hiOf v)
       _ → pure ()
     must (compareRecords (Map.toList ref2) h2)
   it "answers exact lookups and bounded ordered range reads from pages, across leaves, from and after a key" $ do
@@ -290,6 +290,216 @@ spec = describe "pinned readers, retirement and reclamation" $ do
     bytes ← either (\e → expectationFailure (show e) >> fail "encode") pure (encodePage (hIdent h3) beyond)
     let tampered = h3 {hDisk = diskWrite (PageNo fr) bytes (hDisk h3), hStore = storeFromRoots (hCfg h3) (hIdent h3) roots {rLoose = []}}
     planOn tampered >>= refusedAsCorrupt "a free extent past the used space"
+  it "holds at most twice the tree's height of pages when a floor read answers, a neighbour under another parent included" $ do
+    -- a runs tree of at least three levels: the first leaf of a parent has its left neighbour under the previous parent, reached from the
+    -- root by a path of its own; the window the read fills never holds more than the path to the target and that one
+    let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. 11999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+    h ← must (foldM (\hh ks → do (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 [(k, Just (runRec 20)) | k ← ks]); case out of Committed _ → Right hh'; other → Left ("history was not built: " <> show other)) (newH smallSpec ident0) (chunks keys))
+    let height = heightOf h TreeRuns
+    height `shouldSatisfy` (>= 3)
+    (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h)))
+    let h1 = h {hStore = s1}
+        pagesHeld k = case k of
+          KeyRun c lo → do
+            w0 ← either (const (Left "stale")) Right (readerWindow (hStore h1) tok)
+            let go w (n ∷ Int) = case readerFloorRun (hStore h1) tok w c lo of
+                  Read _ → Right (windowSize w)
+                  ReadNeeds p | n < 100 → case diskRead (hDisk h1) p of
+                    Just bs → either (Left . show) (\x → go x (n + 1)) (windowInsert (cfgUsablePages (hCfg h1)) p bs w)
+                    Nothing → Left "missing page"
+                  other → Left (show other)
+            go w0 0
+          _ → Right 0
+    sizes ← must (mapM pagesHeld (every 7 keys))
+    maximum sizes `shouldSatisfy` (<= readPathPages height)
+    -- the old estimate (the path and the two leaves beside the target) was too small for a neighbour under another parent
+    maximum sizes `shouldSatisfy` (> height + 2)
+  it "holds the pages of two landings when a ranged read starts at a floor, at a deleted separator that sends the floor across the root's children" $ do
+    -- the same runs tree, with the records that begin each root child but the first deleted: their separators stay, so a floor read at one
+    -- lands in a leaf of its own child (a path of the whole height) and finds its answer in the last leaf of the child before (another path
+    -- of its own, sharing only the root), and the scan then starts from that key: the window holds what two landings load
+    let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. 11999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    built ← must (foldM (\hh ks → commit hh [(k, Just (runRec 20)) | k ← ks]) (newH smallSpec ident0) (chunks keys))
+    let height = heightOf built TreeRuns
+        total = cfgUsablePages (hCfg built)
+        decodeAt p = either (const Nothing) Just . decodePage (hIdent built) total p =<< diskRead (hDisk built) p
+    height `shouldSatisfy` (>= 3)
+    rootNo ← maybe (expectationFailure "a runs root expected" >> fail "root") pure (rootOf (storeRoots (hStore built)) TreeRuns)
+    separators ← case decodeAt rootNo of
+      Just (Page _ _ _ (Inner es)) → pure [k | key ← drop 1 (map fst es), Just k@(KeyRun _ _) ← [decodeKey TreeRuns key]]
+      other → expectationFailure ("an inner root expected: " <> show other) >> fail "root"
+    length separators `shouldSatisfy` (>= 1)
+    h ← must (commit built [(k, Nothing) | k ← separators])
+    (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h)))
+    let h1 = h {hStore = s1}
+        survivors = filter (`notElem` separators) keys
+        floorOf k = last (filter (`elem` survivors) (takeWhile (/= k) keys))
+        answer k = do
+          w0 ← either (const (Left "stale")) Right (readerWindow (hStore h1) tok)
+          let go w (n ∷ Int) = case readerRange (hStore h1) tok w TreeRuns (RangeFloor k) 3 of
+                Read rs → Right (map fst rs, windowSize w)
+                ReadNeeds p | n < 200 → case diskRead (hDisk h1) p of
+                  Just bs → either (Left . show) (\x → go x (n + 1)) (windowInsert (cfgUsablePages (hCfg h1)) p bs w)
+                  Nothing → Left "missing page"
+                other → Left (show other)
+          go w0 0
+    answers ← must (mapM (\k → fmap ((,) k) (answer k)) separators)
+    -- every answer starts at the record before the deleted one, in the child before the separator's own
+    forM_ answers $ \(k, (found, _)) → take 1 found `shouldBe` [floorOf k]
+    -- the window holds at most the pages of two landings of a tree of this height, however the two sit
+    maximum [n | (_, (_, n)) ← answers] `shouldSatisfy` (<= 2 * readLandingPages height - 1)
+  it "proves a page unreachable from each root of distinct pinned versions in the pages of one landing, for a page under an interior child of the root" $ do
+    -- a runs tree whose root has at least three children, three readers pinned at three versions that each replace the page under the middle
+    -- child (so their roots are distinct), and the probe of that page's first key at its level against every one of those roots and the
+    -- committed one: each proof alone holds no more than one landing, however many roots there are (the proof of a root is a unit of its own)
+    let keys = [runKey (toInteger (i `div` 100)) (toInteger (i `mod` 100)) 10 | i ← [0 .. 59999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    built ← must (foldM (\hh ks → commit hh [(k, Just (runRec 20)) | k ← ks]) (newH smallSpec ident0) (chunks keys))
+    let height = heightOf built TreeRuns
+        total = cfgUsablePages (hCfg built)
+        decodeAt h p = either (const Nothing) Just . decodePage (hIdent h) total p =<< diskRead (hDisk h) p
+        rootOf' h = maybe (expectationFailure "a runs root expected" >> fail "root") pure (rootOf (storeRoots (hStore h)) TreeRuns)
+    height `shouldSatisfy` (>= 3)
+    root0 ← rootOf' built
+    (probed, child) ← case decodeAt built root0 of
+      Just (Page _ _ _ (Inner es)) | length es >= 3 → case es !! (length es `div` 2) of
+        (k, Child c _) → pure (k, c)
+      other → expectationFailure ("a root of three children or more expected: " <> show (fmap (\(Page _ l _ b) → (l, case b of Inner es → length es; _ → 0)) other)) >> fail "root"
+    probeKey ← maybe (expectationFailure "a run key expected" >> fail "key") pure (decodeKey TreeRuns probed)
+    -- three versions, a reader pinned at each, each replacing the pages under that child by updating the key it starts at
+    let pinnedAfter h key value = do
+          h1 ← must (commit h [(key, Just (runRec value))])
+          (tok, s1) ← must (either (Left . show) Right (acquireReader (hStore h1)))
+          pure (h1 {hStore = s1}, tok)
+    (tok0, s0) ← must (either (Left . show) Right (acquireReader (hStore built)))
+    (hA, tokA) ← pinnedAfter built {hStore = s0} probeKey 21
+    (hB, tokB) ← pinnedAfter hA probeKey 22
+    (hC, tokC) ← pinnedAfter hB probeKey 23
+    roots ← mapM rootOf' [built, hA, hB, hC]
+    length (nub roots) `shouldBe` 4
+    let probeAt h (tok, root) = do
+          w0 ← either (const (Left "stale")) Right (readerWindow (hStore h) tok)
+          let go w (n ∷ Int) = case runM (livePageAt TreeRuns (Just (Disk root)) probed 1) (newEdit 0 w) of
+                Right (found, _) → Right (found, windowSize w)
+                Left (Need p) | n < 400 → case diskRead (hDisk h) p of
+                  Just bs → either (Left . show) (\x → go x (n + 1)) (windowInsert (cfgUsablePages (hCfg h)) p bs w)
+                  Nothing → Left "missing page"
+                Left other → Left (show other)
+          go w0 0
+    answers ← must (mapM (probeAt hC) (zip [tok0, tokA, tokB, tokC] roots))
+    -- the oldest root still holds the page under the middle child; the newer roots hold others there
+    map (== Just child) (map fst answers) `shouldBe` [True, False, False, False]
+    -- each root has a page there, a different one
+    length (nub (map fst answers)) `shouldBe` 4
+    maximum (map snd answers) `shouldSatisfy` (<= readLandingPages height)
+  it "plans an edit's absent-key lookups through a window of the edit and one landing, carrying a memo of each neighbouring chain through a checkpoint, and plans what a wide window plans" $ do
+    -- inserts of absent keys into leaves far apart in a tree of three levels: each lookup concludes an absence from the leaf's neighbours,
+    -- whose pages no window of the edit's paths and ONE landing can keep for all of them; a checkpoint hands on the memos, and the next window
+    -- reads no chain a memo stands for
+    let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. 11999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    h ← must (foldM (\hh ks → commit hh [(k, Just (runRec 20)) | k ← ks]) (newH smallSpec ident0) (chunks keys))
+    let hf = max 1 (heightOf h TreeFree)
+        hrec = heightOf h TreeRuns
+        inserts = [(runKey (toInteger c) 60 10, Just (runRec 20)) | c ← [3, 40, 77, 120, 160, 200 ∷ Int]]
+        delta = deltaFor (hStore h) True False 1 inserts
+        formula = editWindowPages (length inserts) (max 0 (heightOf h TreeRetire - 1)) hf hrec 0
+        bounded n = standardBounds {bdWindowPages = n, bdWindowBytes = n * windowPageBytes}
+        planWith bounds = fillCounting h (storeWindow (hStore h)) (\w → planDeltaPinned bounds (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) w Ordinary delta)
+        -- the smallest window the plan succeeds in (the formula is the promise: this fixture needs far less), by descent from it
+        smallest n = case planWith (bounded (n - 1)) of
+          Right (Planned _, _, _, _) | n > 2 → smallest (n - 1)
+          _ → n
+        lim = smallest formula
+        tight = bounded lim
+    hrec `shouldSatisfy` (>= 3)
+    (wide, wideWindow, _, cpsWide) ← must (planWith standardBounds)
+    (narrow, _, _, cps) ← must (planWith tight)
+    cpsWide `shouldBe` 0
+    case (wide, narrow) of
+      (Planned a, Planned b) → do
+        -- a plan that ends in one window, with no checkpoint, is charged the facts it holds: the proof that each page it retires is absent from
+        -- the index (one for each committed page it replaced) and the memos of its lookups, beside the pages of its window
+        -- the charge is its parts, each from the ledger the plan ended with: the pages of its window and its probes, the facts it holds and the new
+        -- pages it holds packed; the facts are those of each committed page it replaced (absent from the index) and the memos of its lookups, so
+        -- the charge without them is smaller by exactly what they are
+        let m = plMeasure a
+        (ramDecodedCopies (mRam m) == windowBytes wideWindow + windowProbesBytes wideWindow + mFactBytes m + mOverlayBytes m, mFactBytes m >= factBytes * mReplacedRecord m, mReplacedRecord m > 0) `shouldBe` (True, True, True)
+        -- the same plan, through checkpoints, in a window that held no more than its bound
+        plPages b `shouldBe` plPages a
+        mPagesWritten (plMeasure b) `shouldBe` mPagesWritten (plMeasure a)
+        (mWindowPages (plMeasure b) <= lim) `shouldBe` True
+        cps `shouldSatisfy` (> 0)
+      other → expectationFailure ("the plans were not both planned: " <> take 300 (show other))
+  it "charges a header-only plan the pages it read to find its writes were no-ops: every page of its window, in the pins and the continuation too" $ do
+    -- writes of the values the tree already holds change no page, but the plan reads the paths of the keys to know it: its window holds several
+    -- pages, and the charge counts each (the page pins and the continuation beside the decoded copies)
+    let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. 11999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    h ← must (foldM (\hh ks → commit hh [(k, Just (runRec 20)) | k ← ks]) (newH smallSpec ident0) (chunks keys))
+    let same = [(runKey (toInteger c) 7 10, Just (runRec 20)) | c ← [3, 90, 170 ∷ Int]]
+        delta = deltaFor (hStore h) True False 1 same
+    (planned, w, _, _) ← must (fillCounting h (storeWindow (hStore h)) (\win → planDeltaPinned standardBounds (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) win Ordinary delta))
+    case planned of
+      Planned pl → do
+        let m = plMeasure pl
+            held = windowSize w
+        (mPagesWritten m, held > 1) `shouldBe` (0, True)
+        (mWindowPages m, ramPagePins (mRam m), ramContinuation (mRam m) >= 8 * held) `shouldBe` (held, 16 * held, True)
+      other → expectationFailure ("a header-only plan was expected, got " <> take 200 (show other))
+  it "charges the proof that a retired page is absent from the index at exactly its cost: one committed leaf, no neighbouring chain, no checkpoint" $ do
+    -- a tree of one leaf has no neighbour to read, so the plan that replaces the leaf makes no memo: the facts it holds are proofs, each of a
+    -- known cost and a count the fixture knows without the ledger: one for the committed page it replaced (absent from the index), and for each
+    -- page it writes below the used space three (unreachable, not retired, not free) when the loose list supplies it, two when an extent does
+    let first = runKey 1 0 10
+        keys = first : [runKey 1 (toInteger i) 10 | i ← [1 .. 4 ∷ Int]]
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    h ← must (commit (newH smallSpec ident0) [(k, Just (runRec 20)) | k ← keys])
+    heightOf h TreeRuns `shouldBe` 1
+    let delta = deltaFor (hStore h) True False 1 [(first, Just (runRec 21))]
+    (planned, w, _, cps) ← must (fillCounting h (storeWindow (hStore h)) (\win → planDeltaPinned standardBounds (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) win Ordinary delta))
+    case planned of
+      Planned pl → do
+        let m = plMeasure pl
+        (cps, mReplacedRecord m) `shouldBe` (0, 1)
+        -- the held facts are those proofs at their accounted cost, and the charge is exactly its parts
+        let underUsed = length [() | (PageNo q, _) ← plPages pl, q < rHw (storeRoots (hStore h))]
+            fromLoose = length [() | (pg, _) ← plPages pl, pg `elem` rLoose (storeRoots (hStore h))]
+            proofs = mReplacedRecord m + 3 * fromLoose + 2 * (underUsed - fromLoose)
+        (underUsed > 0, mFactBytes m) `shouldBe` (True, factBytes * proofs)
+        ramDecodedCopies (mRam m) `shouldBe` windowBytes w + windowProbesBytes w + factBytes * proofs + mOverlayBytes m
+      other → expectationFailure ("a plan was expected, got " <> take 200 (show other))
   it "refuses more readers than the bound and a token of another store" $ do
     let h = newH smallSpec ident0
         other = newH smallSpec (identOf 2 7)
@@ -307,6 +517,7 @@ spec = describe "pinned readers, retirement and reclamation" $ do
         (x, y) `shouldBe` (Applied, Duplicate)
         when (controlBytes s1 <= controlBytes s2) $ expectationFailure "a released reader should lower the control bytes"
   where
+    every n xs = [x | (i, x) ← zip [0 ∷ Int ..] xs, i `mod` n == 0]
     sortOn' ∷ Ord b ⇒ [b] → [b]
     sortOn' = Map.keys . Map.fromList . map (\x → (x, ()))
     hiOf ∷ Record → Int64

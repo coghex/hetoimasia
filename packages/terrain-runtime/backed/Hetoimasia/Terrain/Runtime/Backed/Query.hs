@@ -68,6 +68,8 @@ data Query a = Query
   , qRun ∷ Provider → Observed a
   , qFetch ∷ !(Maybe (PageNo, Ticket))
   , qDraining ∷ !Bool
+  , qPin ∷ !Int
+  -- ^ The pages this query may pin: 'gatherPinLimit' in production.
   , qFresh ∷ !Bool
   -- ^ The window holds only what this query read: one that fills it then needs more than a reader may
   -- pin. A query begun on a window an earlier read on the same pin filled starts again on an empty
@@ -89,14 +91,14 @@ startQuery ∷ Store → (Provider → Observed a) → Either GatherRefusal (Sto
 startQuery store run = case acquireReader store of
   Left refusal → Left (NoPin refusal)
   Right (token, pinned) → case (readerWindow pinned token, readerVersion pinned token) of
-    (Right window, Right version) → Right (pinned, Query token window version run Nothing False True Map.empty)
+    (Right window, Right version) → Right (pinned, Query token window version run Nothing False gatherPinLimit True Map.empty)
     _ → Left PinRefused
 
 -- | A query on a pin its caller already holds and keeps (a regional build's one committed version),
 -- through the window an earlier read on that pin left: the caller takes it back with 'queryWindow',
 -- and releases the pin itself ('endQuery' is not called on this query).
-queryOnPin ∷ ReaderToken → Word64 → Window → Map PageNo Condition → (Provider → Observed a) → Query a
-queryOnPin token version window refused run = Query token window version run Nothing False False refused
+queryOnPin ∷ Int → ReaderToken → Word64 → Window → Map PageNo Condition → (Provider → Observed a) → Query a
+queryOnPin pin token version window refused run = Query token window version run Nothing False pin False refused
 
 -- | The window the query reads through, for the next read on the same pin.
 queryWindow ∷ Query a → Window
@@ -145,11 +147,11 @@ stepQuery io closing store q = case qFetch q of
             Right (Right Nothing) → pure (q, QFailed (HandleDefect "a record was missing with no page to read"))
             Right (Right (Just page))
               | Just cause ← Map.lookup page (qRefused q) → pure (q, QFailed (HandlePausedFor cause))
-              | windowSize (qWindow q) >= gatherPinLimit, not (qFresh q) →
+              | windowSize (qWindow q) >= qPin q, not (qFresh q) →
                   pure $ case readerWindow store (qToken q) of
                     Right fresh → (q {qWindow = fresh, qFresh = True}, QMore)
                     Left why → (q, QFailed (HandleDefect (Text.pack ("a query's own pin was refused: " <> show why))))
-              | windowSize (qWindow q) >= gatherPinLimit → pure (q, QFailed (HandleDefect "a query needed more pages than a reader may pin"))
+              | windowSize (qWindow q) >= qPin q → pure (q, QFailed (HandleDefect "a query needed more pages than a reader may pin"))
               | otherwise →
                   submitRead (ioService io) (ioBacking io) (ioClass io) (storeConfig store) page 1 ReadValidated >>= \case
                     Left failure → pure (q, QFailed (classifyFailure closing JkRead failure))

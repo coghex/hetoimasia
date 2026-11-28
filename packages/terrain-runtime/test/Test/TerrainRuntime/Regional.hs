@@ -35,9 +35,8 @@ import Hetoimasia.Terrain.Source (CellSpec (..), LayerSpec (..), PatchSpec (..),
 import Hetoimasia.Terrain.Runtime.Backed.Backend (Closing (..))
 import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (RegionCopy (..))
 import Hetoimasia.Terrain.Connectivity (defaultConnectivityLimits, prepareConnectivity)
-import Hetoimasia.Terrain.Runtime.Backed.Gather (gatherPinLimit)
 import Hetoimasia.Terrain.Runtime.Backed.RegionCopy (regionEntryBytes, shortBytes)
-import Hetoimasia.Terrain.Runtime.Backed.Regional (BProgress (..), Build, buildCopies, buildDraining, buildRegionsDone, buildVersion, endBuild, startBuild, stepBuild)
+import Hetoimasia.Terrain.Runtime.Backed.Regional (BProgress (..), Build, buildCopies, buildDraining, buildRegionsDone, buildVersion, endBuild, startBuild, startBuildWith, stepBuild)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (Planned (..), TxClass (..))
 import Hetoimasia.Terrain.Source (defaultSourceLimits, mkSource)
 import qualified Data.ByteString.Short as SBS
@@ -1010,9 +1009,11 @@ retentionSpec = describe "what a regional build retains" $ do
   it "drops the window a read replaces when it starts afresh inside a region: a build never holds more pages than a reader may pin" $
     H.withEnv $ \env → do
       -- runs dense enough that one region's reads need more pages than one window holds
-      let dense = [(x, y, z) | x ← [-1 .. 16], y ← [-1 .. 16], z ← [0, 6 .. 30]]
+      let dense = [(x, y, z) | x ← [-1 .. 16], y ← [-1 .. 16], z ← [0, 2 .. 32]]
       (store, io) ← directStore env dense
-      (pinned, b) ← either (fail . show) pure (startBuild store (envOf (fxSpec together)) [region 0 0 0])
+      -- a pin of a few pages, a fraction of what the region's reads touch (the store holds ninety-odd leaves), so that the reads
+      -- must start afresh many times; at the reader's whole credit the fixture's tree fits one window and none would
+      (pinned, b) ← either (fail . show) pure (startBuildWith smallPin store (envOf (fxSpec together)) [region 0 0 0])
       waits ← newIORef (0 ∷ Int)
       counts ← newIORef []
       (b', done) ← driveBuild io pinned b $ \waiting now → when waiting $ do
@@ -1029,10 +1030,13 @@ retentionSpec = describe "what a regional build retains" $ do
       held ← reverse <$> readIORef counts
       -- windows were started afresh inside the region (the pages held fell while it was read) ...
       or (zipWith (>) held (drop 1 held)) `shouldBe` True
-      -- ... and the build never held more pages than one window's
-      maximum held `shouldSatisfy` (<= gatherPinLimit)
+      -- ... and the build never held more pages than one window's, and (the old windows being released) never fewer starts than
+      -- the reads that filled one: the pages held fell many times, not once
+      maximum held `shouldSatisfy` (<= smallPin)
+      length (filter id (zipWith (>) held (drop 1 held))) `shouldSatisfy` (>= 5)
       [(r, isJust (rcTerrain c), isJust (rcKnowledge c)) | (r, c) ← copied] `shouldBe` [(region 0 0 0, True, True)]
   where
+    smallPin = 64
     accounted c = regionEntryBytes + maybe 0 (shortBytes . SBS.length) (rcTerrain c) + maybe 0 (shortBytes . SBS.length) (rcKnowledge c)
 
 failureSpec ∷ Spec

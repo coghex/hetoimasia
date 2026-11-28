@@ -174,7 +174,7 @@ data RefPage = RefPage
   }
   deriving stock (Eq, Show)
 
--- | Parse a page by the documented layout: magic, version 1, kind, tree, the arena
+-- | Parse a page by the documented layout: magic, version 2, kind, tree, the arena
 -- and source identities, the page's own number, level, count, payload end and the
 -- checksum of the first 4,092 bytes.
 parsePage ∷ Word64 → Word64 → ByteString → Either String RefPage
@@ -182,7 +182,7 @@ parsePage arena source bs
   | BS.length bs /= 4096 = Left "length"
   | getLe32' bs 4092 /= refCrc32c (BS.take 4092 bs) = Left "checksum"
   | BS.take 4 bs /= BC.pack "HTRP" = Left "magic"
-  | getLe16' bs 4 /= 1 = Left "version"
+  | getLe16' bs 4 /= 2 = Left "version"
   | getLe64' bs 8 /= arena = Left "arena"
   | getLe64' bs 16 /= source = Left "source"
   | otherwise = do

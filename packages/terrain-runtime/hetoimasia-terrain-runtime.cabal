@@ -256,6 +256,7 @@ test-suite terrain-runtime-tests
         Test.TerrainRuntime.Store.Readers
         Test.TerrainRuntime.Store.Reference
         Test.TerrainRuntime.Store.Replay
+        Test.TerrainRuntime.Store.Tagged
         Test.TerrainRuntime.Store.Scenes
         Test.TerrainRuntime.Store.Trees
         Test.TerrainRuntime.Store.Workload

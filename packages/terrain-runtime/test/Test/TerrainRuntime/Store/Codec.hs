@@ -42,6 +42,14 @@ import Test.TerrainRuntime.Store.Reference
 bias ∷ Integer → ByteString
 bias n = be64' (fromInteger (n + 2 ^ (63 ∷ Int)))
 
+-- | A run's value from the documented layout: the upper end, then its payload tag (0 for air).
+airV ∷ Integer → ByteString
+airV hi = BS.snoc (bias hi) 0
+
+-- | A mask run's value: the upper end, the tag 1 and the mask.
+maskV ∷ Integer → Word8 → ByteString
+maskV hi m = BS.append (bias hi) (BS.pack [1, m])
+
 -- | A page, built from the documented layout alone.
 buildPage ∷ Word64 → Word64 → Word64 → Word8 → Word8 → Word8 → Int → ByteString → ByteString
 buildPage arena source no kind tree level count payload =
@@ -49,7 +57,7 @@ buildPage arena source no kind tree level count payload =
       header =
         BS.concat
           [ BC.pack "HTRP"
-          , le16' 1
+          , le16' 2
           , BS.pack [kind, tree]
           , le64' arena
           , le64' source
@@ -87,7 +95,7 @@ decode = decodePage ident0 total (PageNo 0)
 
 -- | A valid one-entry runs leaf, page 0, arena 1, source 7.
 runPage ∷ ByteString
-runPage = buildPage 1 7 0 1 0 0 1 (leafPayload [(BS.concat [bias 3, bias (-4), bias 5], bias 9)])
+runPage = buildPage 1 7 0 1 0 0 1 (leafPayload [(BS.concat [bias 3, bias (-4), bias 5], airV 9)])
 
 spec ∷ Spec
 spec = describe "the private page codec against independent bytes" $ do
@@ -108,22 +116,22 @@ spec = describe "the private page codec against independent bytes" $ do
         crc32c bytes `shouldBe` refCrc32c bytes
   describe "independently written pages" $ do
     it "encodes a one-run leaf to exactly the documented bytes" $ do
-      let page = Page TreeRuns 0 (PageNo 0) (Leaf [(BS.concat [bias 3, bias (-4), bias 5], bias 9)])
+      let page = Page TreeRuns 0 (PageNo 0) (Leaf [(BS.concat [bias 3, bias (-4), bias 5], airV 9)])
       encodePage ident0 page `shouldBe` Right runPage
       BS.length runPage `shouldBe` 4096
       -- header fields at their documented offsets
       BS.take 4 runPage `shouldBe` BC.pack "HTRP"
-      getLe16' runPage 4 `shouldBe` 1
+      getLe16' runPage 4 `shouldBe` 2
       (BS.index runPage 6, BS.index runPage 7, BS.index runPage 32) `shouldBe` (1, 0, 0)
       (getLe64' runPage 8, getLe64' runPage 16, getLe64' runPage 24) `shouldBe` (1, 7, 0)
-      (getLe16' runPage 34, getLe16' runPage 36) `shouldBe` (1, 40 + 2 + 24 + 8)
+      (getLe16' runPage 34, getLe16' runPage 36) `shouldBe` (1, 40 + 2 + 24 + 9)
       getLe32' runPage 4092 `shouldBe` refCrc32c (BS.take 4092 runPage)
     it "is what the planner writes for that record, and decodes back to it" $ do
       let h0 = newH smallSpec ident0
           d = deltaFor (hStore h0) True False 1 [(runKey 3 (-4) 5, Just (runRec 9))]
       Right (Planned plan) ← pure (fillPlan h0 d Ordinary)
       plPages plan `shouldBe` [(PageNo 0, runPage)]
-      decode runPage `shouldBe` Right (Page TreeRuns 0 (PageNo 0) (Leaf [(BS.concat [bias 3, bias (-4), bias 5], bias 9)]))
+      decode runPage `shouldBe` Right (Page TreeRuns 0 (PageNo 0) (Leaf [(BS.concat [bias 3, bias (-4), bias 5], airV 9)]))
     it "writes every record kind in the documented key and value bytes and keeps them apart by tree" $ do
       let h0 = newH smallSpec ident0
           srcKey = srcNodeWith
@@ -195,7 +203,8 @@ spec = describe "the private page codec against independent bytes" $ do
       let check ∷ String → ByteString → PageError → Expectation
           check name bs e = (name, decode (reseal bs)) `shouldBe` (name, Left e)
       check "magic" (mutate 0 (+ 1) runPage) BadMagic
-      check "version" (setBytes 4 (le16' 2) runPage) (UnsupportedVersion 2)
+      -- version 2 replaces version 1 for every page: the old version and an unknown one are refused, with no reader of either
+      forM_ [0, 1, 3, 65535] $ \v → check ("version " <> show v) (setBytes 4 (le16' v) runPage) (UnsupportedVersion v)
       check "kind" (mutate 6 (const 9) runPage) (UnsupportedKind 9)
       check "kind zero" (mutate 6 (const 0) runPage) (UnsupportedKind 0)
       check "tree" (mutate 7 (const 9) runPage) (UnsupportedTree 9)
@@ -215,24 +224,24 @@ spec = describe "the private page codec against independent bytes" $ do
       let leaf t es = buildPage 1 7 0 1 t 0 (length es) (leafPayload es)
           dec = decodePage ident0 total (PageNo 0)
           key = BS.concat [bias 0, bias 0, bias 5]
-          val = bias 9
+          val = airV 9
       dec (leaf 0 [(BS.empty, val)]) `shouldBe` Left (KeyLength 0)
       dec (leaf 0 [(BS.replicate 65 1, val)]) `shouldBe` Left (KeyLength 65)
       dec (leaf 0 [(key, BS.replicate 65 1)]) `shouldBe` Left (ValueLength 65)
       dec (leaf 0 [(BS.append key (BS.pack [1]), val)]) `shouldBe` Left MalformedKey
       dec (leaf 0 [(key, BS.append val (BS.pack [1]))]) `shouldBe` Left MalformedValue
       -- interval: lo >= hi, hi beyond the top level
-      dec (leaf 0 [(key, bias 5)]) `shouldBe` Left MalformedValue
-      dec (leaf 0 [(key, bias 4)]) `shouldBe` Left MalformedValue
-      dec (leaf 0 [(key, bias (2 ^ (62 ∷ Int) + 1))]) `shouldBe` Left MalformedValue
+      dec (leaf 0 [(key, airV 5)]) `shouldBe` Left MalformedValue
+      dec (leaf 0 [(key, airV 4)]) `shouldBe` Left MalformedValue
+      dec (leaf 0 [(key, airV (2 ^ (62 ∷ Int) + 1))]) `shouldBe` Left MalformedValue
       -- a column outside the supported range
       dec (leaf 0 [(BS.concat [bias (2 ^ (62 ∷ Int)), bias 0, bias 5], val)]) `shouldBe` Left MalformedKey
       -- key order, duplicates and adjacent runs of one column (which must be coalesced)
       let k2 = BS.concat [bias 0, bias 0, bias 20]
-      dec (leaf 0 [(k2, bias 25), (key, val)]) `shouldBe` Left KeyOrder
+      dec (leaf 0 [(k2, airV 25), (key, val)]) `shouldBe` Left KeyOrder
       dec (leaf 0 [(key, val), (key, val)]) `shouldBe` Left KeyOrder
-      dec (leaf 0 [(key, bias 20), (k2, bias 25)]) `shouldBe` Left KeyOrder
-      either (const False) (const True) (dec (leaf 0 [(key, bias 19), (k2, bias 25)])) `shouldBe` True
+      dec (leaf 0 [(key, airV 20), (k2, airV 25)]) `shouldBe` Left KeyOrder
+      either (const False) (const True) (dec (leaf 0 [(key, airV 19), (k2, airV 25)])) `shouldBe` True
       -- links
       let src = BS.concat [BS.singleton 0, bias 1, bias 2, bias 3, BS.replicate 27 0]
       either (const False) (const True) (dec (leaf 1 [(src, BS.concat [BS.singleton 0, be64' 1, BS.singleton 0])])) `shouldBe` True
@@ -343,7 +352,7 @@ spec = describe "the private page codec against independent bytes" $ do
         Left (Bad (BadLevel 1) (PageNo 6)) → pure ()
         other → expectationFailure ("a cycle was not stopped: " <> either show (const "answered") other)
       -- a child that violates its parent's bounds is refused too
-      let leafAt no k = buildPage 1 7 no 1 0 0 1 (leafPayload [(k, bias 9)])
+      let leafAt no k = buildPage 1 7 no 1 0 0 1 (leafPayload [(k, airV 9)])
           leaf6 = leafAt 6 (BS.concat [bias 0, bias 0, bias 0])
           parent = buildPage 1 7 5 2 0 1 1 (BS.concat [BS.singleton 24, BS.concat [bias 5, bias 5, bias 5], le64' 6, le32' (getLe32' leaf6 4092)])
           w2 = add (add (uncheckedWindow ident0 0) 5 parent) 6 leaf6
@@ -368,7 +377,7 @@ spec = describe "the private page codec against independent bytes" $ do
         Left (Bad KindMismatch (PageNo 6)) → pure ()
         other → expectationFailure ("a child of another tree was followed: " <> either show (const "answered") other)
       -- the left child holds a key at the right separator, which belongs to the right child
-      let leafKeys no ks = buildPage 1 7 no 1 0 0 (length ks) (leafPayload [(k, bias (lo + 1)) | (k, lo) ← ks])
+      let leafKeys no ks = buildPage 1 7 no 1 0 0 (length ks) (leafPayload [(k, airV (lo + 1)) | (k, lo) ← ks])
           left = leafKeys 6 [(runKeyBytes 1000, 1000), (runKeyBytes 5000, 5000)]
           right = leafKeys 7 [(runKeyBytes 5000, 5000)]
           wBound = add (add (add (uncheckedWindow ident0 0) 5 (inner 5 [(sepL, (6, left)), (sepR, (7, right))])) 6 left) 7 right
@@ -381,7 +390,7 @@ spec = describe "the private page codec against independent bytes" $ do
           runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
           sepL = runKeyBytes 1000
           sepR = runKeyBytes 5000
-          leaf6 = buildPage 1 7 6 1 0 0 1 (leafPayload [(runKeyBytes 1000, bias 1001)])
+          leaf6 = buildPage 1 7 6 1 0 0 1 (leafPayload [(runKeyBytes 1000, airV 1001)])
           good = getLe32' leaf6 4092
           entry k crc = BS.concat [BS.singleton 24, k, le64' 6, le32' crc]
           parentOf crcs = buildPage 1 7 5 2 0 1 (length crcs) (BS.concat [entry k crc | (k, crc) ← crcs])
@@ -406,7 +415,7 @@ spec = describe "the private page codec against independent bytes" $ do
       let add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
           runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
           sepL = runKeyBytes 1000
-          small6 = buildPage 1 7 6 1 0 0 1 (leafPayload [(sepL, bias 1001)])
+          small6 = buildPage 1 7 6 1 0 0 1 (leafPayload [(sepL, airV 1001)])
           crc6 = getLe32' small6 4092
           parent = buildPage 1 7 5 2 0 1 1 (BS.concat [BS.singleton 24, sepL, le64' 6, le32' crc6])
           crc5 = getLe32' parent 4092
@@ -431,7 +440,7 @@ spec = describe "the private page codec against independent bytes" $ do
           runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
           sepL = runKeyBytes 1000
           -- a child of a production window holds at least a quarter of a payload: 30 entries of 34 bytes
-          leaf6 = buildPage 1 7 6 1 0 0 30 (leafPayload [(runKeyBytes (1000 + 10 * i), bias (1003 + 10 * i)) | i ← [0 .. 29]])
+          leaf6 = buildPage 1 7 6 1 0 0 30 (leafPayload [(runKeyBytes (1000 + 10 * i), airV (1003 + 10 * i)) | i ← [0 .. 29]])
           good = getLe32' leaf6 4092
           parent = buildPage 1 7 5 2 0 1 1 (BS.concat [BS.singleton 24, sepL, le64' 6, le32' good])
           fill w = add (add w 5 parent) 6 leaf6
@@ -465,7 +474,7 @@ spec = describe "the private page codec against independent bytes" $ do
           add win no bs = either (error . show) id (windowInsert total (PageNo no) bs win)
           -- the left subtree holds one entry; the right one is a two-page cycle of level-1 pages (the
           -- record of the checksum of the page the cycle comes back to cannot be true, and is never followed)
-          leaf = buildPage 1 7 4 1 0 0 1 (leafPayload [(runKeyBytes 1000, bias 1001)])
+          leaf = buildPage 1 7 4 1 0 0 1 (leafPayload [(runKeyBytes 1000, airV 1001)])
           leftInner = inner 1 1 [(sepL, 4, crcOf leaf)]
           cycB = inner 5 1 [(sepR, 2, 0)]
           cycA = inner 2 1 [(sepR, 5, crcOf cycB)]
@@ -496,11 +505,11 @@ spec = describe "the private page codec against independent bytes" $ do
 
     it "refuses a sibling whose keys break its parent's separators before merging it into a new page" $ do
       let runKeyBytes lo = BS.concat [bias 0, bias 0, bias lo]
-          entries from = [(runKeyBytes lo, bias (lo + 1)) | lo ← [from, from + 10 .. from + 10 * 29]]
-          -- a left leaf of 30 runs (just over the under-full threshold, so one deletion
+          entries from = [(runKeyBytes lo, airV (lo + 1)) | lo ← [from, from + 10 .. from + 10 * 28]]
+          -- a left leaf of 29 runs (just over the under-full threshold, so one deletion
           -- under-fills it) and a right leaf whose keys lie BELOW its separator
-          left = buildPage 1 7 1 1 0 0 30 (leafPayload (entries 1000))
-          right = buildPage 1 7 2 1 0 0 30 (leafPayload (entries 100))
+          left = buildPage 1 7 1 1 0 0 29 (leafPayload (entries 1000))
+          right = buildPage 1 7 2 1 0 0 29 (leafPayload (entries 100))
           sepLeft = runKeyBytes 1000
           sepRight = runKeyBytes 5000
           parent = buildPage 1 7 3 2 0 1 2 (BS.concat [BS.concat [BS.singleton 24, k, le64' c, le32' (getLe32' cb 4092)] | (k, (c, cb)) ← [(sepLeft, (1, left)), (sepRight, (2, right))]])
@@ -519,9 +528,11 @@ spec = describe "the private page codec against independent bytes" $ do
     -- value. That is only sound while no present record encodes to nothing, so this is pinned over every Record constructor at its
     -- edges, and through the window itself: present and absent answers come back as they went in, whatever their bytes.
     let col = columnAt 3 (-4)
-        nodes = [srcNode 0 0 0, srcNode 1 (-1) 5, srcNode 300 (-300) 70000, RunNode col minBound, RunNode col 0, RunNode col maxBound]
+        mask n = either (error . show) id (mkCornerMask n)
+        nodes = [srcNode 0 0 0, srcNode 1 (-1) 5, srcNode 300 (-300) 70000, RunNode col minBound, RunNode col 0, RunNode col maxBound, CellNode col minBound, CellNode col 0, CellNode col maxBound]
         records =
           [RecRun v | v ← [minBound, -1, 0, 1, maxBound]]
+            <> [RecMaskRun v m | v ← [minBound, 1, maxBound], m ← [mask 1, mask 15]]
             <> [rootRec n k | n ← [0, 1, maxBound], k ← [False, True]]
             <> [RecChild n | n ← nodes]
             <> [todoRec x y z d | (x, y, z) ← [(0, 0, 0), (-5, 7, 300)], d ← [0, 1, 255]]
@@ -529,33 +540,65 @@ spec = describe "the private page codec against independent bytes" $ do
     it "encodes every constructor, at its edges, to at least one byte, and the empty value decodes under no key" $ do
       forM_ records $ \r → (r, BS.null (encodeValue r)) `shouldBe` (r, False)
       forM_ keys $ \k → decodeValue k BS.empty `shouldBe` Nothing
-    it "returns a present and an absent answer through the window as they went in (records, and the 16-byte floor answer)" $ do
+    it "returns a present and an absent answer through the window as they went in (records, and the 17-byte floor answer of either tag)" $ do
       let recKey = KeyLink (srcNode 1 1 1)
-          floors = [((col, 0), Just (minBound, maxBound, ReplaceAir)), ((col, 1), Just (0, 0, ReplaceAir)), ((col, 2), Nothing)]
+          floors = [((col, 0), Just (minBound, maxBound, ReplaceAir)), ((col, 1), Just (0, 0, ReplaceAir)), ((col, 2), Nothing), ((col, 4), Just (-3, 8, ReplaceMask (mask 1))), ((col, 5), Just (2, 3, ReplaceMask (mask 15)))]
           w = windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(recKey, Just r) | r ← [childRec (srcNode 2 2 2)]] [])) (emptyWindow ident0 1)
           wAbsent = windowCheckpoint (factsOf (Fingerprint ident0 1 [] []) [] (ReadSet [(recKey, Nothing)] floors)) (emptyWindow ident0 1)
       windowReadRecord recKey w `shouldBe` Just (Just (childRec (srcNode 2 2 2)))
       windowReadRecord recKey wAbsent `shouldBe` Just Nothing
       windowReadRecord (KeyLink (srcNode 9 9 9)) w `shouldBe` Nothing
-      forM_ floors $ \(q, a) → windowReadFloor q wAbsent `shouldBe` Just (fmap (\(lo, hi, _) → (lo, hi)) a)
+      forM_ floors $ \(q, a) → windowReadFloor q wAbsent `shouldBe` Just a
       windowReadFloor (col, 3) wAbsent `shouldBe` Nothing
-  describe "what the version 1 pages cannot hold" $ do
-    -- The pages hold air runs and the voids of runs and source components. A mask run and the void of a narrowed cell have no
-    -- encoding that reads back, so a write that carries one is refused by the round-trip check and never stored as a removal.
+  describe "the tagged runs and the narrowed cell's void of version 2" $ do
     let col = columnAt 3 (-4)
-        mask5 = either (error . show) id (mkCornerMask 5)
-    it "never reads a mask run back, as a removal or as anything else" $ do
-      forM_ [1, 7, maxBound] $ \hi → do
-        BS.null (encodeValue (RecMaskRun hi mask5)) `shouldBe` False
-        decodeValue (runKey 3 (-4) 0) (encodeValue (RecMaskRun hi mask5)) `shouldBe` Nothing
-    it "never reads the void of a narrowed cell back, as a key or as a child" $ do
-      decodeKey TreeLinks (encodeKey (KeyLink (CellNode col 0))) `shouldBe` Nothing
-      decodeValue (KeyLink (RunNode col 0)) (encodeValue (RecChild (CellNode col 0))) `shouldBe` Nothing
-    it "keeps no read fact of a mask-tagged floor answer, and keeps the air ones and the absent ones" $ do
-      let fp = Fingerprint ident0 1 [] []
-          floors = [((col, 0), Just (0, 4, ReplaceMask mask5)), ((col, 1), Just (0, 4, ReplaceAir)), ((col, 2), Nothing)]
-          w = windowCheckpoint (factsOf fp [] (ReadSet [] floors)) (emptyWindow ident0 1)
-      (windowReadFloor (col, 0) w, windowReadFloor (col, 1) w, windowReadFloor (col, 2) w) `shouldBe` (Nothing, Just (Just (0, 4)), Just Nothing)
+        mask n = either (error . show) id (mkCornerMask n)
+        key = BS.concat [bias 0, bias 0, bias 5]
+        k2 = BS.concat [bias 0, bias 0, bias 20]
+        dec t es = decodePage ident0 total (PageNo 0) (buildPage 1 7 0 1 t 0 (length es) (leafPayload es))
+        accepted = either (const False) (const True)
+    it "writes a mask run in the documented bytes (upper end, the tag 1, the mask) and reads every mask back" $ do
+      forM_ [1 .. 15] $ \m →
+        forM_ [7, 2 ^ (62 ∷ Int)] $ \hi → do
+          encodeValue (RecMaskRun hi (mask m)) `shouldBe` BS.append (bias (toInteger hi)) (BS.pack [1, fromIntegral m])
+          decodeValue (runKey 3 (-4) 0) (encodeValue (RecMaskRun hi (mask m))) `shouldBe` Just (RecMaskRun hi (mask m))
+      encodeValue (RecRun 7) `shouldBe` airV 7
+    it "round-trips the void of a narrowed cell, as a key and as a child, in the documented bytes" $ do
+      encodeKey (KeyLink (CellNode col 5)) `shouldBe` BS.concat [BS.singleton 2, bias 3, bias (-4), bias 5]
+      decodeKey TreeLinks (encodeKey (KeyLink (CellNode col 5))) `shouldBe` Just (KeyLink (CellNode col 5))
+      decodeValue (KeyLink (RunNode col 0)) (encodeValue (RecChild (CellNode col 0))) `shouldBe` Just (RecChild (CellNode col 0))
+      decodeValue (KeyLink (CellNode col 0)) (encodeValue (RecChild (CellNode col 0))) `shouldBe` Nothing
+    it "refuses a malformed payload: a zero or out-of-range mask, an unknown tag, a missing or surplus byte" $ do
+      let bad v = dec 0 [(key, v)] `shouldBe` Left MalformedValue
+      bad (maskV 9 0)
+      bad (maskV 9 16)
+      bad (maskV 9 255)
+      bad (BS.append (bias 9) (BS.pack [2, 1]))
+      bad (BS.append (bias 9) (BS.pack [255]))
+      bad (BS.append (bias 9) (BS.pack [1]))
+      bad (BS.append (bias 9) (BS.pack [0, 1]))
+      bad (BS.append (maskV 9 3) (BS.pack [0]))
+      bad (maskV 5 3)
+      bad (maskV (2 ^ (62 ∷ Int) + 1) 3)
+    it "accepts touching runs of different payloads and refuses touching runs of the same one, whichever tag" $ do
+      accepted (dec 0 [(key, airV 20), (k2, maskV 25 5)]) `shouldBe` True
+      accepted (dec 0 [(key, maskV 20 5), (k2, airV 25)]) `shouldBe` True
+      accepted (dec 0 [(key, maskV 20 5), (k2, maskV 25 6)]) `shouldBe` True
+      dec 0 [(key, maskV 20 5), (k2, maskV 25 5)] `shouldBe` Left KeyOrder
+      dec 0 [(key, airV 20), (k2, airV 25)] `shouldBe` Left KeyOrder
+      -- a gap between equal payloads is legal, and an overlap is refused whatever the payloads
+      accepted (dec 0 [(key, maskV 19 5), (k2, maskV 25 5)]) `shouldBe` True
+      dec 0 [(key, maskV 21 5), (k2, maskV 25 6)] `shouldBe` Left KeyOrder
+      dec 0 [(key, airV 21), (k2, maskV 25 5)] `shouldBe` Left KeyOrder
+    it "keeps alternating tags at every level of a column legal, and the pages decode to the records they hold" $ do
+      let level n = (BS.concat [bias 0, bias 0, bias n], if even n then airV (n + 1) else maskV (n + 1) 5)
+          levels = [level n | n ← [0 .. 30]]
+      accepted (dec 0 levels) `shouldBe` True
+    it "reads a mask run back through a floor read as the tag it was written with" $ do
+      let h0 = newH smallSpec ident0
+          d = deltaFor (hStore h0) True False 1 [(runKey 3 (-4) 5, Just (RecMaskRun 9 (mask 5)))]
+      Right (Planned plan) ← pure (fillPlan h0 d Ordinary)
+      plPages plan `shouldBe` [(PageNo 0, buildPage 1 7 0 1 0 0 1 (leafPayload [(BS.concat [bias 3, bias (-4), bias 5], maskV 9 5)]))]
   describe "revision and version arithmetic" $ do
     it "refuses a revision or version that would wrap, and a delta that names another authority" $ do
       let cfg = either (error . show) id (mkStoreConfig smallSpec)

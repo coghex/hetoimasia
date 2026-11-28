@@ -1,11 +1,11 @@
--- | Reading the removed runs of some columns from a pinned committed version of the store,
+-- | Reading the replacement runs (air or a corner mask) of some columns from a pinned committed version of the store,
 -- through the storage backend, as a resumable state machine.
 --
 -- Every read of terrain a client can ask for (a cell, a column's runs, a surface) and every
 -- load of resident detail is answered from the immutable source plus the removals that are
--- authoritative in the store. This is how those removals are fetched: a reader pins one
+-- authoritative in the store. This is how those replacements are fetched: a reader pins one
 -- committed version ('startGather'), the runs of each column are read in key order through a
--- window that holds at most the pages one reader may pin ('readerPinnedCacheBytes', 32), and the
+-- window that holds at most the pages one reader may pin ('readerPinnedCacheBytes'), and the
 -- caller builds the answer with the pure query functions over the runs it was given. A page
 -- the read needs and the window lacks is a read job to the backend, never an empty answer, never
 -- air and never the pristine source: a missing or contradicting page is a typed outcome.
@@ -22,9 +22,10 @@
 -- A 'Gather' and the 'Store' it pins are the terrain owner's, on its one thread. The pin is a
 -- record in the store (accounted as a reader record) and lives from 'startGather' to 'endGather'.
 -- The window's pages are copies the window made (the service's result buffer is retired inside the
--- outcome's borrow), at most 32 of them.
+-- outcome's borrow), at most 'gatherPinLimit' of them.
 module Hetoimasia.Terrain.Runtime.Backed.Gather
   ( Gather
+  , GatherRun
   , GatherRefusal (..)
   , startGather
   , startGatherWith
@@ -57,6 +58,7 @@ import Data.Word (Word64)
 import qualified Data.ByteString as BS
 import qualified Data.Text as Text
 import Hetoimasia.Terrain.Cell (Column)
+import Hetoimasia.Terrain.Changes (Replacement (..))
 import Hetoimasia.Terrain.Discovery (Record (..), RecordKey (..))
 import Hetoimasia.Terrain.Runtime.Backed.Backend
 import Hetoimasia.Terrain.Runtime.Backed.Fault
@@ -97,6 +99,9 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.State (StoreConfig, cfgTotalPag
 import Hetoimasia.Terrain.Runtime.Store.Internal.Protocol (Supply (..))
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Window, windowInsert, windowSize)
 
+-- | One replacement run of a column: its levels @[lo, hi)@ and what it does to each of them.
+type GatherRun = (Column, Int64, Int64, Replacement)
+
 -- | The pages one reader may pin: its window never holds more.
 gatherPinLimit ∷ Int
 gatherPinLimit = fromIntegral (readerPinnedCacheBytes `div` fromIntegral windowPageBytes)
@@ -118,7 +123,7 @@ data Gather = Gather
   -- ^ Times in a row the window filled before the call could finish.
   , gPeak ∷ !Int
   -- ^ The most pages the window held when a ranged read answered.
-  , gRuns ∷ ![(Column, Int64, Int64)]
+  , gRuns ∷ ![GatherRun]
   -- ^ Runs found, newest first.
   , gCap ∷ !Int
   -- ^ The most runs the gather may keep: what the ranges it reads can hold ('maxBound' for a load).
@@ -168,7 +173,7 @@ data GProgress
   | -- | Wait for this (one read job), then 'stepGather' again.
     GBlocked !(STM ())
   | -- | Every run of every column, ascending by column and level. The pin is still held: 'endGather'.
-    GDone ![(Column, Int64, Int64)]
+    GDone ![GatherRun]
   | -- | The read ended with the decision for its cause. The pin is still held: 'endGather'.
     GFailed !Handling
   | -- | The gather was cancelled and its read job has drained: nothing of the backend is held for it. The
@@ -207,9 +212,9 @@ startGatherCapped pin cap store columns = case acquireReader store of
 -- it reads through the window it is given, refuses the pages the caller already failed to read, and
 -- never releases the pin ('endGather' is the caller's own, once, for the pin as a whole). The caller
 -- takes the window back with 'gatherWindow' for its next read on the same pin. Its window may pin the
--- reader's whole credit: what it keeps is charged to its caller's reservation, as a load's is.
-gatherOnPin ∷ ReaderToken → Word64 → Window → Map PageNo Condition → Int → [(Column, Int64, Int64)] → Gather
-gatherOnPin token version window refused cap columns = Gather token window columns Nothing gatherPinLimit maxRangeRecords 0 0 [] cap 0 columns Nothing version False refused
+-- pages it is given (the reader's whole credit, 'gatherPinLimit', in production): what it keeps is charged to its caller's reservation, as a load's is.
+gatherOnPin ∷ Int → ReaderToken → Word64 → Window → Map PageNo Condition → Int → [(Column, Int64, Int64)] → Gather
+gatherOnPin pin token version window refused cap columns = Gather token window columns Nothing pin maxRangeRecords 0 0 [] cap 0 columns Nothing version False refused
 
 -- | The window the gather reads through, for the next read on the same pin.
 gatherWindow ∷ Gather → Window
@@ -267,18 +272,18 @@ stepGather io closing store g = case gFetch g of
                       -- the first key of a later column ends the column, read or not
                       below = \case (KeyRun col _, _) → columnKey col < columnKey column; _ → False
                       fromOurs = dropWhile below records
-                      column' = [(col, lo, hi) | (KeyRun col lo, RecRun hi) ← takeWhile ours fromOurs]
-                      mine = [(col, lo, hi) | (col, lo, hi) ← column', hi > from, lo < to]
+                      column' = [(col, lo, hi, tag) | (KeyRun col lo, rec) ← takeWhile ours fromOurs, Just (hi, tag) ← [runOf rec]]
+                      mine = [run | run@(_, lo, hi, _) ← column', hi > from, lo < to]
                       -- the column ends at the first record of another column after it, at a run past its range,
                       -- or when the tree ends
-                      ended = length column' < length fromOurs || any (\(_, lo, _) → lo >= to) column' || length records < gLimit g
+                      ended = length column' < length fromOurs || any (\(_, lo, _, _) → lo >= to) column' || length records < gLimit g
                       next = case reverse records of
                         (key, _) : _ → Just (RangeAfter key)
                         [] → Nothing
                       g' = g {gRuns = reverse mine <> gRuns g, gKept = gKept g + length mine, gStrikes = 0, gPeak = max (gPeak g) (windowSize (gWindow g))}
                    in pure $
                         -- WHAT IS KEPT NEVER PASSES THE CAP, at any step: the cap is what the ranges can hold
-                        -- (coalesced runs, a level apart at least), so passing it is a defect
+                        -- (disjoint runs, at least a level each), so passing it is a defect
                         if gKept g' > gCap g
                           then (g, GFailed (HandleDefect (Text.pack ("a read kept " <> show (gKept g') <> " runs, more than the " <> show (gCap g) <> " its ranges can hold"))))
                           else
@@ -306,6 +311,10 @@ stepGather io closing store g = case gFetch g of
                 ReadWrongWindow why → pure (g, GFailed (HandleDefect (Text.pack ("a reader's window was refused: " <> show why))))
   where
     restart x = either (const x) (\w → x {gWindow = w}) (readerWindow store (gToken x))
+    runOf = \case
+      RecRun hi → Just (hi, ReplaceAir)
+      RecMaskRun hi mask → Just (hi, ReplaceMask mask)
+      _ → Nothing
     -- a column's place in the runs tree's key order: the leading bytes of its keys
     columnKey col = BS.take 16 (encodeKey (KeyRun col 0))
     corrupt ∷ IntegrityWhy → Handling
