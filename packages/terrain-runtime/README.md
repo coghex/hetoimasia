@@ -828,7 +828,7 @@ starts from an empty window; a checkpoint with no new fact is the typed window r
 phase's own pages: the read phase at most the bound it runs under (every promised bound holds one whole read, at most
 `2 * height` pages), the edit phase the edit formula plus the residue. `readResiduePages` is derived from the byte
 limit (the worst explicit edit, `removalWindowPages`, 308 pages at the deepest trees and 16 pinned versions, leaves room for
-2 more whole pages beside its `removalWorstProbes` probes, at the MEASURED page and probe costs below); the probe figures are counted from the pages written
+116 more whole pages beside its `removalWorstProbes` probes, at the MEASURED page and probe costs below); the probe figures are counted from the pages written
 (`minimumRemovalPages`, 205 for the eight writes of `maxEditWrites`; the discovery unit's `discoveryUnitPagesWritten`, 120). The facts are RAM, in the plan's
 charge as a retained continuation (held PACKED, the encoded key and value as two compact byte arrays, and charged from what is held plus 128 bytes an entry: at most
 256 bytes a fact, 50,688 B for an edit's 198 reads and 33,792 B for a unit's 132, under
@@ -997,7 +997,7 @@ committed page. The supply is checked as it is read: a loose page or free extent
 the used page space, a free extent overlapping the one before it, or any page that would be
 handed out twice is corruption (an `Integrity` refusal), never an allocation. It writes at most **256 pages (1 MiB), index, allocator and
 retirement pages included**; reserves at most **4 MiB of RAM**; reads through a window of at
-most **1.3125 MiB of validated page buffers** (320 pages at the measured page cost: the whole pages of the worst explicit edit, a tagged edit of eight record writes, at the tallest trees with every reader pinned, 306, its 205 ownership probes and one read's page, rounded up to 64 KiB); and a discovery batch performs at most **64 structural
+most **1.3125 MiB of validated page buffers** (320 pages at the measured page cost: the whole pages of the worst explicit edit, a tagged edit of eight record writes, at the tallest trees, 192 with one proof of one root, its 205 ownership probes and the read residue; the owner's approved figure); and a discovery batch performs at most **64 structural
 updates**, where a structural update is #661's: one connection inspected, at most one
 pair of classes joined, and the obligation's progress. The batch keeps its
 continuation in the obligation records; when a tighter bound stops it earlier, it is
@@ -1084,7 +1084,7 @@ place a page is overwritten or freed, asks every owner a page can have:
 | Owner | Decided by | A page it owns is refused as |
 | --- | --- | --- |
 | a committed tree (live roots) | the page is on the path of its own first key at its level in the tree it belongs to | `SuppliedPageLive` |
-| a pinned reader's tree (at most 16) | the same descent from each pinned record root | `SuppliedPageLive` / `RetiredPageLive` |
+| a pinned reader's tree (at most 16) | the same descent from each pinned record root, one root at a time (a unit of its own, so the window holds one landing of one root beside the edit and a checkpoint carries the roots done) | `SuppliedPageLive` / `RetiredPageLive` |
 | a retirement list | looked for under the version it is stamped with in the retirement tree | `SuppliedPageLive` |
 | an outstanding retirement entry | **one lookup in the retired-page index** (below) | `SuppliedPageRetired` |
 | the free extents, for a page taken from the loose list | one floor lookup in the allocator tree | `SuppliedPageDoubleOwned` |
