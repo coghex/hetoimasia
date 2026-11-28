@@ -82,6 +82,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.State
   , maxEditReads
   , removalWindowPages
   , editWindowPages
+  , worstReplacedPerWrite
   , readResiduePages
   , readPathPages
   , readLandingPages
@@ -206,8 +207,8 @@ windowPageBytes = pageSize + windowPageOverhead
 -- it really holds; a plan that needs more is refused with a typed result.
 --
 -- The owner's approved figure (the amendment of the issue that raised it from 1.25 MiB, when the narrowing's eighth write did not fit),
--- and it holds: the whole pages the worst explicit edit holds at once at the tallest trees ('editWindowPages' of 'maxEditWrites': 192
--- pages, 823,296 bytes, with ONE proof of ONE root, a landing of the tallest tree) and its ownership probes ('removalWorstProbes',
+-- and it holds: the whole pages the worst explicit edit holds at once at the tallest trees ('editWindowPages' of 'maxEditWrites': 304
+-- pages, 1,303,552 bytes, with ONE proof of ONE root, a landing of the tallest tree) and its ownership probes ('removalWorstProbes',
 -- 205 of 'probeBytes': 52,480 bytes) leave the rest to the read phase ('readResiduePages'). The 4 MiB of RAM, the 256 pages and
 -- 1 MiB written per transaction and the 64 MiB edit bank are unchanged.
 maxWindowBytes ∷ Int
@@ -530,12 +531,18 @@ readPhaseProofFactBytes = maxProofFacts * factBytes + maxMemoBytes
 maxTypedReads ∷ Int
 maxTypedReads = (txnRamLimit - maxWindowBytes - worstOwnershipBytes - maxReadFactBytes - readPhaseProofFactBytes - readPhaseStagedWriteBytes - readPhaseFixedBytes) `div` typedReadBytes
 
+-- | The most committed pages one record write reads and replaces in a tree of @hrec@ levels: its path and, where a deletion merges with
+-- or redistributes from a sibling (the leaf, and each level above it but the root), that sibling: @2 * hrec - 1@. Every one of them
+-- is indexed in the retirement tree, and read again by the plan that is run again after a checkpoint.
+worstReplacedPerWrite ∷ Int → Int
+worstReplacedPerWrite hrec = 2 * hrec - 1
+
 -- | The pages an edit of @writes@ record writes holds at once (see 'removalWindowPages', which is the edit of 'maxEditWrites'): what it
 -- writes and reads, and ONE proof, a landing of the record trees or of the allocator tree. The readers pinned (the last figure)
 -- are not part of it: each root's proof is a unit of its own.
 editWindowPages ∷ Int → Int → Int → Int → Int → Int
 editWindowPages writes retireInternals hf hrec _pins =
-  writes * hrec + (writes * hrec + 1) + retireInternals + 3 * hf + max (readLandingPages hrec) (readLandingPages hf)
+  writes * worstReplacedPerWrite hrec + (writes * worstReplacedPerWrite hrec + 1) + retireInternals + 3 * hf + max (readLandingPages hrec) (readLandingPages hf)
 
 -- | The pages the SMALLEST unit of a discovery batch holds at once: one connection inspection, at most 'discoveryUnitWrites'
 -- (3) record writes, an edit like a removal's but of fewer writes, so never more than 'removalWindowPages'.

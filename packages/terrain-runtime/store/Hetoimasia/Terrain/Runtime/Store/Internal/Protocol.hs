@@ -77,7 +77,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Admission (Failure, classifyPla
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format (PageError, PageNo, maxLevel, maxTxnPages)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Model (Store, planDiscovery, planMaintenance, planNarrowing, planRemoval, planWriteProbeFor, storeConfig, storeWindow)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan (CapacityWhy (..), Plan, PlanRefusal (..), Planned (..))
-import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgTotalPages, maxEditReads, maxEditWrites, maxMemoBytes, maxReaders, maxReclaimPages)
+import Hetoimasia.Terrain.Runtime.Store.Internal.State (cfgTotalPages, maxEditReads, maxEditWrites, maxMemoBytes, maxReaders, maxReclaimPages, worstReplacedPerWrite)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Facts, Window, memoBaseBytes, reduceWork, windowCheckpoint, windowInsert, windowPageNumbers, windowProbe, windowReadFactCount, windowSize, windowWork)
 
 -- | One planning call through a window. The production planners are the three below;
@@ -196,7 +196,7 @@ data Supply
 maxCheckpoints ∷ Int
 maxCheckpoints =
   maxTxnPages * (maxReaders + 1 + 2)
-    + (maxEditWrites * (maxLevel + 1) + 1)
+    + (maxEditWrites * worstReplacedPerWrite (maxLevel + 1) + 1)
     + maxMemoBytes `div` memoBaseBytes
     + maxReclaimPages
     + maxEditReads

@@ -876,6 +876,7 @@ readOutcome (Left (Bad err p)) = ReadCorrupt (BadPage err p)
 readOutcome (Left (TooTall t)) = ReadCorrupt (BrokenInvariant t)
 readOutcome (Left (Invariant t)) = ReadCorrupt (BrokenInvariant t)
 readOutcome (Left (Over _)) = ReadCorrupt CorruptCounters
+readOutcome (Left (MemoOver _)) = ReadCorrupt CorruptCounters
 
 -- | Run a read against a pinned version, refusing a dead token and a window of another
 -- store or version before any page is read.

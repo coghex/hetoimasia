@@ -253,6 +253,12 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
           pure (Variant ("memo of a chain, bounds of " <> show len <> " bytes") v (Just (factBytesOf (memoOf len 1))))
       | len ← [8, retireKeyBytes, maxKeyBytes]
       ]
+        -- the bounds are slices of a 4 KiB page buffer when the memo is made: the memo copies them (and forces the copies), so it keeps nothing
+        -- of the buffer, measured with the buffers dropped and the bounds NOT read before the measurement
+        <> [ do
+               v ← retainedPer 400 (ints 400) id (\is → pure (Set.fromList [edgeFact TreeRetire True (PageNo (fromInteger (big i))) (fromIntegral i) (Just (BS.take retireKeyBytes (BS.drop 100 (page4k i)))) (Just (BS.take retireKeyBytes (BS.drop 2000 (page4k i)))) (Just 1) | i ← is])) (\st → evaluate (Set.foldl' (\acc f → acc + pageOf f) (0 ∷ Int) st))
+               pure (Variant "memo made from slices of page buffers, the buffers dropped (bounds not read)" v (Just (factBytesOf (memoOf retireKeyBytes 1))))
+           ]
         <> [ do
                v ← retainedPer 400 (ints 400) id (\is → pure (foldl' (\e i → recordProof (FactUnreachable (PageNo (fromInteger (big i)))) (PageNo (fromInteger (big i))) (foldl' (\e' r → recordFact (FactOutOf (PageNo (fromInteger (big i))) (PageNo (fromInteger (big (i + r))))) e') e [1 .. 16])) (newEdit 0 (emptyWindow ident0 1)) is)) (\e → evaluate (editFreshBytes e))
                pure (Variant "the proofs of completed pages: one fact each, their 16 root units dropped (read before the facts are forced)" v (Just (factBytes + 24)))
@@ -493,9 +499,13 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       FactGone v (PageNo p) → fromIntegral (v + p)
       FactOutOf (PageNo a) (PageNo b) → fromIntegral (a + b)
       FactNotIndexed (PageNo p) → fromIntegral p
-      FactEdge side (PageNo p) crc lo hi lvl → fromEnum side + fromIntegral p + fromIntegral crc + maybe 0 SBS.length lo + maybe 0 SBS.length hi + lvl
+      FactEdge _ side (PageNo p) crc lo hi lvl → fromEnum side + fromIntegral p + fromIntegral crc + maybe 0 SBS.length lo + maybe 0 SBS.length hi + lvl
+    page4k i = BS.pack [fromIntegral (i + j) | j ← [1 .. pageSize]]
+    pageOf f = case f of
+      FactEdge _ _ (PageNo p) _ _ _ _ → fromIntegral p
+      _ → 0
     memoOf len i =
-      FactEdge (even i) (PageNo (fromInteger (big i))) (fromIntegral i) (Just (toShort (BS.pack [fromIntegral (i + j) | j ← [1 .. len]]))) (Just (toShort (BS.pack [fromIntegral (i + j + 7) | j ← [1 .. len]]))) (i `mod` 8)
+      FactEdge TreeRuns (even i) (PageNo (fromInteger (big i))) (fromIntegral i) (Just (toShort (BS.pack [fromIntegral (i + j) | j ← [1 .. len]]))) (Just (toShort (BS.pack [fromIntegral (i + j + 7) | j ← [1 .. len]]))) (i `mod` 8)
     rootsOf full loose i =
       let pg k = if full then Just (PageNo (fromInteger (big (i + k)))) else Nothing
        in Roots

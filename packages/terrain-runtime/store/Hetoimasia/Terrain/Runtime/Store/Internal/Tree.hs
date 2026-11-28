@@ -64,6 +64,9 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , recordFact
   , carryFacts
   , windowMemoBytes
+  , editMemoBytes
+  , withMemoCap
+  , edgeFact
   , recordProof
   , editFacts
   , factBytes
@@ -307,11 +310,11 @@ data Fact
     -- A proof against every committed and pinned root is a unit for each, so that the window holds one root's paths at a time;
     -- the units of a page are dropped when its proof is complete.
     FactOutOf !PageNo !PageNo
-  | -- | A MEMO of an edit's lookup: the chain of pages from this page (the root of a neighbouring subtree, with the checksum its parent
+  | -- | A MEMO of an edit's lookup in the given tree: the chain of pages from this page (the root of a neighbouring subtree, with the checksum its parent
     -- records) to its extreme leaf on one side (@True@: the leftmost) was read and every key of every page lay inside the bounds and the
     -- level the descent gave it. Pages are immutable and the bounds are values, so the fact does not depend on the path that led
     -- there, a staged one included: the lookup that made it need not load the chain again, and a checkpoint carries it.
-    FactEdge !Bool !PageNo !Word32 !(Maybe ShortByteString) !(Maybe ShortByteString) !Int
+    FactEdge !TreeId !Bool !PageNo !Word32 !(Maybe ShortByteString) !(Maybe ShortByteString) !Int
   deriving stock (Eq, Ord, Show)
 
 -- | The state a set of facts was proven against: the store, the version, the committed roots with the
@@ -393,7 +396,7 @@ factBytes = 80
 -- set node and the margin the suite measures it under) and each bound it carries, a @Just@, a byte string and its array (48 bytes)
 -- and the bytes of the key rounded to a word.
 factBytesOf ∷ Fact → Int
-factBytesOf (FactEdge _ _ _ lo hi _) = memoBaseBytes + boundBytes lo + boundBytes hi
+factBytesOf (FactEdge _ _ _ _ lo hi _) = memoBaseBytes + boundBytes lo + boundBytes hi
 factBytesOf _ = factBytes
 
 -- | The accounted bytes of a memo that holds no bound, and of one bound of a key of the given length.
@@ -592,6 +595,8 @@ data Stop
     Invariant !TreeId
   | -- | The overlay of new pages would hold more bytes than a plan may: the figure.
     Over !Int
+  | -- | The memos a plan holds would pass what its RAM is charged for: the figure.
+    MemoOver !Int
   deriving stock (Eq, Show)
 
 -- | A reference to a node: a committed page (with the checksum its parent records for it, when
@@ -664,6 +669,8 @@ data Edit = Edit
   -- ^ The facts this plan established so far (in this call, not those its window already carried).
   , eDelSplits ∷ !Int
   -- ^ The nodes the deletions of this plan split: the counter of the suite, read by nothing else.
+  , eMemoCap ∷ !Int
+  -- ^ The accounted bytes of memos ('FactEdge') the plan may hold, those its window carries and those it makes ('maxMemoBytes' in production).
   , eHot ∷ [(PageNo, Node)]
   -- ^ The last few committed nodes parsed, so a run of updates in one neighbourhood
   -- does not parse the same page again for every key. At most 'hotNodes' are held and
@@ -674,6 +681,14 @@ data Edit = Edit
 -- checkpoint carries what both made).
 carryFacts ∷ Edit → Edit → Edit
 carryFacts from to = to {eFacts = eFacts from}
+
+-- | The edit, holding at most the given accounted bytes of memos.
+withMemoCap ∷ Int → Edit → Edit
+withMemoCap cap e = e {eMemoCap = cap}
+
+-- | The accounted bytes of the memos ('FactEdge') a plan has made.
+editMemoBytes ∷ Edit → Int
+editMemoBytes e = sum [factBytesOf f | f@(FactEdge {}) ← eFacts e]
 
 -- | The accounted bytes of the memos ('FactEdge') a window carries.
 windowMemoBytes ∷ Window → Int
@@ -697,7 +712,7 @@ editFacts = reverse . eFacts
 -- | A fresh plan state over a window, whose new pages may hold at most the given
 -- accounted bytes.
 newEdit ∷ Int → Window → Edit
-newEdit budget w = Edit w IntMap.empty 0 IntMap.empty [] budget 0 Set.empty 0 [] 0 []
+newEdit budget w = Edit w IntMap.empty 0 IntMap.empty [] budget 0 Set.empty 0 [] 0 maxBound []
 
 -- | The accounted bytes of the new pages the plan holds now.
 editFreshBytes ∷ Edit → Int
@@ -905,14 +920,23 @@ validateLandingWith memo tree (Just root) key stopLevel = go root Nothing Nothin
 edgeChecked ∷ Bool → TreeId → Bool → Ref → Maybe ByteString → Maybe ByteString → Maybe Int → M ()
 edgeChecked True tree leftmost ref@(DiskRef pg (Just crc)) lo hi lvl = do
   e ← getEdit
-  let fact = FactEdge leftmost pg crc (toShort <$> lo) (toShort <$> hi) (maybe (-1) id lvl)
+  let fact = edgeFact tree leftmost pg crc lo hi lvl
   if windowKnows fact (eWin e) || fact `elem` eFacts e
     then pure ()
     else do
       _ ← extremeLeaf tree leftmost ref lo hi lvl
       e' ← getEdit
-      putEdit (recordFact fact e')
+      -- the memos a plan holds, those its window carries and those it has made, stay inside what the plan's RAM is charged for
+      let held = windowMemoBytes (eWin e') + editMemoBytes e' + factBytesOf fact
+      if held > eMemoCap e' then stop (MemoOver held) else putEdit (recordFact fact e')
 edgeChecked _ tree leftmost ref lo hi lvl = () <$ extremeLeaf tree leftmost ref lo hi lvl
+
+-- | The memo of a chain, its bounds COPIED out of the page buffers they are slices of and evaluated, so that a fact never keeps a 4 KiB page
+-- alive for the bytes of a key it is charged for.
+edgeFact ∷ TreeId → Bool → PageNo → Word32 → Maybe ByteString → Maybe ByteString → Maybe Int → Fact
+edgeFact tree leftmost pg crc lo hi lvl = FactEdge tree leftmost pg crc (copied lo) (copied hi) (maybe (-1) id lvl)
+  where
+    copied = maybe Nothing (\b → let !c = toShort b in Just c)
 
 -- | The page a tree currently holds at a level on the path of a key, if the tree has
 -- one there: the root when its level is the target, else the child reference of the

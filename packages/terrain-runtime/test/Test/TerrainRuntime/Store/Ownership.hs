@@ -38,7 +38,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Pa
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (be64, isRetireEntryKey, versionKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (windowInsert)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), windowCheckpoint, windowInsert, windowProbe)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Harness
 import Test.TerrainRuntime.Store.Protocol (driveFrom)
@@ -294,15 +294,45 @@ spec = describe "page ownership against forged records with valid checksums" $ d
           planWith bounds hh = fillCounting hh (storeWindow (hStore hh)) (\w → planDeltaPinned bounds (hCfg hh) (hIdent hh) (storeRoots (hStore hh)) (pinnedRoots (hStore hh)) w Ordinary (oneEdit hh))
       -- the third (last) pinned root owns pages that neither the committed tree nor the other two reach
       concatMap exclusive [0 .. 2] `shouldSatisfy` (not . null)
-      checkpointed ← forM [(i, v) | i ← [0 .. 2], v ← take 2 (exclusive i)] $ \(i, v) → do
+      forM_ [(i, v) | i ← [0 .. 2], v ← take 2 (exclusive i)] $ \(i, v) → do
         let forged = withRoots h6 (\r → r {rLoose = PageNo v : rLoose r})
         (wide, _, _, _) ← must (planWith standardBounds forged)
-        (narrow, _, _, cps) ← must (planWith tight forged)
+        (narrow, _, _, _) ← must (planWith tight forged)
         refusedLive ("a loose page only pinned root " <> show i <> " reaches, wide") v wide
         refusedLive ("a loose page only pinned root " <> show i <> " reaches, one landing") v narrow
-        pure cps
-      -- the window could not hold the paths of every root at once: the proofs took checkpoints, in the middle of a page's proof
-      sum checkpointed `shouldSatisfy` (> 0)
+      -- a page only the LAST pinned root reaches: its proof against the roots before it is done and carried through a checkpoint (a fact for that
+      -- page and one earlier root, and none that the page is unreachable), and the plan resumed from it ends as the wide window ends
+      lastOnly ← case exclusive 2 of
+        v : _ → pure v
+        [] → expectationFailure "the last pinned root reaches no page of its own" >> fail "exclusive"
+      earlier ← either (const (expectationFailure "stale token" >> fail "pins")) pure
+        (sequence [pinRuns <$> pinsOf (hStore h6) t | t ← [t1, t2]])
+      let forgedLast = withRoots h6 (\r → r {rLoose = PageNo lastOnly : rLoose r})
+          total = cfgUsablePages (hCfg forgedLast)
+          fetch p = maybe BS.empty id (diskRead (hDisk forgedLast) p)
+          resume bounds w cps (n ∷ Int)
+            | n > 20000 = Left "planning did not settle"
+            | otherwise = case planDeltaPinned bounds (hCfg forgedLast) (hIdent forgedLast) (storeRoots (hStore forgedLast)) (pinnedRoots (hStore forgedLast)) w Ordinary (oneEdit forgedLast) of
+                Pending p → case diskRead (hDisk forgedLast) p of
+                  Just bs → either (Left . show) (\w' → resume bounds w' cps (n + 1)) (windowInsert total p bs w)
+                  Nothing → Left "missing page"
+                PendingProbes ps → resume bounds (foldl (\w' p → windowProbe total p (fetch p) w') w ps) cps (n + 1)
+                Checkpoint facts@(Facts _ fs _) → resume bounds (windowCheckpoint facts w) (fs : cps) (n + 1)
+                other → Right (other, reverse cps)
+          boundedTo n = standardBounds {bdWindowPages = n, bdWindowBytes = n * windowPageBytes}
+          reachesRefusal n = case resume (boundedTo n) (storeWindow (hStore forgedLast)) [] 0 of
+            Right (Refused (Integrity (SuppliedPageLive (PageNo q))), _) → q == lastOnly
+            _ → False
+          -- the smallest window in which the plan still reaches its refusal, found by descent from the one of the edit and one landing
+          narrowest n = if n > 2 && reachesRefusal (n - 1) then narrowest (n - 1) else n
+          tightest = narrowest lim
+      (resumed, carried) ← must (resume (boundedTo tightest) (storeWindow (hStore forgedLast)) [] 0)
+      refusedLive "a loose page only the last pinned root reaches, resumed from its checkpoints" lastOnly resumed
+      let carriedOut = [(f, r) | fs ← carried, f@(FactOutOf (PageNo q) (PageNo r)) ← fs, q == lastOnly]
+          earlierRoots = [r | Just (PageNo r) ← rRuns (storeRoots (hStore h6)) : earlier]
+      -- some checkpoint holds the page's proof against an earlier root, part way, and none holds the page as unreachable
+      (length carried, [r | (_, r) ← carriedOut, r `elem` earlierRoots]) `shouldSatisfy` (\(n, rs) → n > 0 && not (null rs))
+      [() | fs ← carried, FactUnreachable (PageNo q) ← fs, q == lastOnly] `shouldBe` []
       -- and driven as a caller drives it, through the checkpoint guard that counts a checkpoint for each root of a page's proof: the refusal is the
       -- driver's own, named, the one the wide window ends in, and never the stall of a guard that ran out
       forM_ [(i, v) | i ← [0 .. 2], v ← take 1 (exclusive i)] $ \(_, v) → do

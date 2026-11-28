@@ -12,6 +12,7 @@
 module Test.TerrainRuntime.Store.Scattered (spec, fullSpec, scattered, fragmented) where
 
 import qualified Data.ByteString as BS
+import Data.ByteString.Short (toShort)
 import Data.List (sortOn)
 import qualified Data.Map.Strict as Map
 import Control.Monad (forM, forM_)
@@ -23,7 +24,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Pa
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeFree, encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, noReadFacts, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, memoBaseBytes, memoBoundBytes, noReadFacts, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
 import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
@@ -400,6 +401,27 @@ specAtOnce depth = describe "round 13: the window a unit of work holds at once, 
       case q of
         Planned pl → (mWindowPages (plMeasure pl) <= lim0) `shouldBe` True
         other → expectationFailure ("no progress after the readers released, window " <> show lim0 <> ": " <> take 300 (show other))
+  it "never ends a reclamation chunk as a refusal for the memo budget: the plans of a budget of a few memos are the plans of the wide one where no neighbour is read" $ do
+    -- the memo budget is met at the record of a memo, as the shrinkable 'TxnRamExceeded', so the chunk selection of the reclamation takes the
+    -- next smaller chunk as it does for any shrinkable refusal. None of the suite's layouts has an allocator tree of two levels (one leaf holds
+    -- its extents), so none has a neighbour whose chain a lookup would memoise: the plans are the same and none is refused
+    let layouts = [("fragmented", fst3 fragmented), ("fragmented, no tail", fst3 fragmentedNoTail)] ++ [("final " <> show d, fst3 (finalChunk d)) | d ← [0, 64, 269]]
+        fst3 (a, _, _) = a
+        room = 6 * (memoBaseBytes + 2 * memoBoundBytes 8)
+        small = standardBounds {bdMemoBytes = room}
+    rows ← forM layouts $ \(name, h0) → do
+      let work = limitWork 64 (storeWindow (hStore h0))
+      (wide, _, _, _) ← must (fillCounting h0 work (planMaintenanceWith standardBounds (hStore h0)))
+      (narrow, _, _, _) ← must (fillCounting h0 work (planMaintenanceWith small (hStore h0)))
+      case (wide, narrow) of
+        (Planned a, Planned b) → pure (name, heightOf h0 TreeFree, mFreed (plMeasure a), mFreed (plMeasure b))
+        (NoWork, NoWork) → pure (name, heightOf h0 TreeFree, 0, 0)
+        other → expectationFailure (name <> ": " <> take 300 (show other)) >> fail "plans"
+    printLine ("MEMO budget at a reclamation chunk (layout, free tree height, freed wide, freed with room for six memos): " <> show rows)
+    [name | (name, _, wf, nf) ← rows, nf > wf] `shouldBe` []
+    -- a layout whose allocator tree has neighbours to read frees fewer pages than the wide plan, and at least one
+    [name | (name, hf, wf, nf) ← rows, hf >= 2, nf >= wf, wf > 1] `shouldBe` []
+    [name | (name, hf, _, nf) ← rows, hf >= 2, nf < 1] `shouldBe` []
   it "answers the typed window result, never a checkpoint with no new fact, for every window too small to hold the edit and one proof" $ do
     let (h0, _, _) = fragmented
     -- every size from 3 pages up to past the at-once bound: planned, or the typed window result; never a loop of checkpoints
@@ -457,6 +479,16 @@ specFingerprint = describe "round 13: the facts a window carries are trusted onl
     -- facts proven against another state replace the ones a window carries, never merge with them
     let other = Facts fpAfter [FactUnreachable (PageNo 20)] noReadFacts
     windowFactCount (windowCheckpoint other w1) `shouldBe` 1
+
+  it "knows the memo of a chain for the tree it was made in: the same page, checksum and bounds under another tree is not known" $ do
+    -- the todo and the free trees both use eight-byte keys, so their bounds can coincide, and a corrupt child reference may name a page one
+    -- of them has already read: only the tree in the memo says the page was checked as a page of THIS tree
+    let (h0, _, _) = fragmented
+        fp = fingerprintOf (hIdent h0) (storeRoots (hStore h0)) []
+        bound = Just (toShort (be64 7))
+        memo t = FactEdge t True (PageNo 5) 99 bound bound 0
+        w = windowCheckpoint (Facts fp [memo TreeTodo] noReadFacts) (storeWindow (hStore h0))
+    (windowKnows (memo TreeTodo) w, windowKnows (memo TreeFree) w, windowKnows (memo TreeLinks) w) `shouldBe` (True, False, False)
 
 -- | A sparse retirement tree is corruption, not a window result: a non-root page of the retirement tree below a quarter
 -- of a payload, re-sealed with every checksum above it, is refused when a plan descends to it; before the rule a
