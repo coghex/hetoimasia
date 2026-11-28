@@ -771,7 +771,7 @@ less than its **atomic unit**: a limit below it means the unit (`windowWorkAtLea
 once: `maintenanceUnitPages`, one page, and `discoveryUnitWrites`, the three writes of one connection inspection,
 which is #661's `worstEdgeWrites`). A standalone removal is one atomic edit and reads no work limit: a window it
 outgrows is a hard capacity result, bounded by `removalWindowPages`. The unit needs a bounded window (the discovery
-unit holds at most `discoveryUnitWindowPages`, 228 pages at the deepest trees and 16 pinned versions, inside the
+unit holds at most `discoveryUnitWindowPages`, 158 pages at the deepest trees and 16 pinned versions, inside the
 explicit edit's 308 and the limit of 320: the edit phase's formula plus the 2 pages of read residue below), so the retry ends in at most six steps with the work done, and never in
 `Invalid`, `Integrity` or `Stale`: a driver that follows this protocol exactly succeeds from every starting limit
 from 1 to 64 (`Test.TerrainRuntime.Store.Protocol`; the table of the refusals `classifyPlan` maps to `FailInvalid`,
@@ -831,7 +831,7 @@ starts from an empty window; a checkpoint with no new fact is the typed window r
 phase's own pages: the read phase at most the bound it runs under (every promised bound holds one whole read, at most
 `2 * height` pages), the edit phase the edit formula plus the residue. `readResiduePages` is derived from the byte
 limit (the worst explicit edit, `removalWindowPages`, 308 pages at the deepest trees and 16 pinned versions, leaves room for
-116 more whole pages beside its `removalWorstProbes` probes, at the MEASURED page and probe costs below); the probe figures are counted from the pages written
+4 more whole pages beside its `removalWorstProbes` probes, at the MEASURED page and probe costs below); the probe figures are counted from the pages written
 (`minimumRemovalPages`, 205 for the eight writes of `maxEditWrites`; the discovery unit's `discoveryUnitPagesWritten`, 120). The facts are RAM, in the plan's
 charge as a retained continuation (held PACKED, the encoded key and value as two compact byte arrays, and charged from what is held plus 128 bytes an entry: at most
 256 bytes a fact, 50,688 B for an edit's 198 reads and 33,792 B for a unit's 132, under
@@ -1000,7 +1000,7 @@ committed page. The supply is checked as it is read: a loose page or free extent
 the used page space, a free extent overlapping the one before it, or any page that would be
 handed out twice is corruption (an `Integrity` refusal), never an allocation. It writes at most **256 pages (1 MiB), index, allocator and
 retirement pages included**; reserves at most **4 MiB of RAM**; reads through a window of at
-most **1.3125 MiB of validated page buffers** (320 pages at the measured page cost: the whole pages of the worst explicit edit, a tagged edit of eight record writes, at the tallest trees, 192 with one proof of one root, its 205 ownership probes and the read residue; the owner's approved figure); and a discovery batch performs at most **64 structural
+most **1.3125 MiB of validated page buffers** (320 pages at the measured page cost: the whole pages of the worst explicit edit, a tagged edit of eight record writes, at the tallest trees, 304 (a record write reads and replaces its path and a sibling a level, `2 * height - 1` pages, each indexed as retired) with one proof of one root, its 205 ownership probes and the read residue; the owner's approved figure); and a discovery batch performs at most **64 structural
 updates**, where a structural update is #661's: one connection inspected, at most one
 pair of classes joined, and the obligation's progress. The batch keeps its
 continuation in the obligation records; when a tighter bound stops it earlier, it is
