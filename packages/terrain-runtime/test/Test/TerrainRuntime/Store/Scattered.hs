@@ -474,7 +474,8 @@ specAtOnce depth = describe "round 13: the window a unit of work holds at once, 
         (final, calls) ← must (trace work [] 0)
         printLine ("MEMO budget, the work limit across planner calls (limit before, limit after, a reduction, memo bytes before, after): " <> show calls)
         -- a reduction from a window that already holds memos: the limit falls, and the memos are released with the checkpoint
-        [() | (limBefore, limAfter, True, memosBefore, memosAfter) ← calls, limAfter < limBefore, memosBefore > 0, memosAfter == 0] `shouldSatisfy` (not . null)
+        -- the FIRST reduction is the memo-budget one: it starts at the whole chunk of 64 with memos held and resumes at 32 with none
+        [(limBefore, limAfter, memosBefore > 0, memosAfter) | (limBefore, limAfter, True, memosBefore, memosAfter) ← take 1 [c | c@(_, _, True, _, _) ← calls]] `shouldBe` [(64, 32, True, 0)]
         -- and a checkpoint taken while a reduced limit is active (not a reduction itself), which the resumed plan goes on from
         [() | (limBefore, _, False, _, _) ← calls, limBefore < 64] `shouldSatisfy` (not . null)
         case final of

@@ -511,6 +511,9 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
     -- fits the approved window with the probes and a page to spare, and the read residue is what it leaves
     let needed = editWindowPages maxEditWrites maxRetireInternals h8 h8 maxReaders * windowPageBytes + removalWorstProbes * probeBytes + windowPageBytes
     (needed <= maxWindowBytes, editWindowPages maxEditWrites maxRetireInternals h8 h8 maxReaders <= approvedPages) `shouldBe` (True, True)
+    -- and the byte limit is no larger than the planner needs: the next multiple of 64 KiB down would not hold the planner's own requirement
+    printLine ("READPHASE window: the planner needs " <> show needed <> " B, the limit is " <> show maxWindowBytes <> " B, the next multiple down " <> show (maxWindowBytes - 64 * 1024) <> " B")
+    (maxWindowBytes - 64 * 1024 < needed) `shouldBe` True
     -- the facts of the worst removal and of a discovery unit are RAM the feasibility proofs count, and they fit
     (maxEditReads * recordFactBytes <= maxReadFactBytes, worstEdgeReads * recordFactBytes <= maxReadFactBytes) `shouldBe` (True, True)
     printLine ("READPHASE bounds: residue " <> show readResiduePages <> " pages; promised removal at (8,8,16) = " <> show (removalWindowPages maxRetireInternals 8 8 16) <> ", discovery unit = " <> show (discoveryUnitWindowPages maxRetireInternals 8 8 16) <> ", one read at 8 levels = " <> show (readPathPages 8) <> "; facts: removal " <> show (maxEditReads * recordFactBytes) <> " B, discovery unit " <> show (worstEdgeReads * recordFactBytes) <> " B, ceiling " <> show maxReadFactBytes)
