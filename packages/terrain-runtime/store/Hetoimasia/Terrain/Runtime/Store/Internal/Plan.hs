@@ -218,6 +218,10 @@ data Measure = Measure
   , mUpdates ∷ !Int
   , mRecordWrites ∷ !Int
   , mFreed ∷ !Int
+  , mFactBytes ∷ !Int
+  -- ^ the facts the plan held when it ended, from the ledger ('editHeldFactBytes'): what its charge carries for them
+  , mOverlayBytes ∷ !Int
+  -- ^ the new pages it held, packed: the rest of what its charge carries as decoded copies, beside its window
   }
   deriving stock (Eq, Show)
 
@@ -889,6 +893,8 @@ planDeltaPinned bounds cfg ident roots pins win0 cls cand = settleAt bounds fp w
                     , mUpdates = dlUpdates cand
                     , mRecordWrites = length writes
                     , mFreed = 0
+                    , mFactBytes = editHeldFactBytes bkEdit3
+                    , mOverlayBytes = editFreshBytes edit1 + editFreshBytes bkEdit3
                     }
             pure (Just (finishPlan ident cls KindCandidate base next' cand encoded measure expected version'))
           -- a short reserve is answered by a larger supply, a bounded number of times, then by a shrinkable
@@ -923,9 +929,9 @@ headerOnly bounds _ ident roots cls cand next version' edit writes = do
       expected = hAuthority next
       next' = roots {rVersion = version', rHeader = next}
       win0 = editWindow edit
-  ram ← chargeFor bounds 0 (windowBytes win0 + windowProbesBytes win0 + editHeldFactBytes edit) 0 0 (length writes) 0 0 (windowReadFactBytes win0)
+  ram ← chargeFor bounds (windowSize win0) (windowBytes win0 + windowProbesBytes win0 + editHeldFactBytes edit) 0 0 (length writes) 0 0 (windowReadFactBytes win0)
   let measure =
-        Measure 0 0 0 0 0 0 0 0 0 (editSteps edit) 0 ram (dlUpdates cand) (length writes) 0
+        Measure 0 0 0 0 0 0 0 0 0 (editSteps edit) (windowSize win0) ram (dlUpdates cand) (length writes) 0 (editHeldFactBytes edit) 0
   pure (finishPlan ident cls KindCandidate base next' cand [] measure expected version')
 
 finishPlan ∷ StoreIdentity → TxClass → PlanKind → Authority → Roots → Delta → [(PageNo, ByteString)] → Measure → Authority → Word64 → Plan
@@ -1174,7 +1180,7 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
                 List stamp xs | pgTree page == TreeRetire && stamp == e && length xs == fromIntegral (retCount ret) → Right xs
                 _ → refuse (Integrity MalformedRetirement)
               let (prefix, remaining) = splitAt (fromIntegral (retDone ret)) ps
-              attempt e ret prefix remaining version' e0 (chunkSizes (length remaining))
+              attempt e ret prefix remaining version' e0 False (chunkSizes (length remaining))
     -- A page a retirement entry names must be a record-tree page no committed or pinned
     -- tree reaches any more: it lies inside the used space, is classified as a record
     -- page (never a list page, a bookkeeping page or nothing) and is not the page the path
@@ -1194,10 +1200,15 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
         )
         unproven
       unreachable bounds fp cfg roots pins RetiredPageLive FactRetirable win pages edit0
-    attempt _ _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
-    attempt e ret prefix remaining version' edit (c : cs) = case tryChunk (Just (e, ret, prefix, remaining)) version' edit c of
+    attempt _ _ _ _ _ _ _ [] = refuse (Integrity MalformedRetirement)
+    attempt e ret prefix remaining version' edit reduced (c : cs) = case tryChunk (Just (e, ret, prefix, remaining)) version' edit c of
       Right plan → Right (Planned plan)
-      Left (OutRefuse why) | not (null cs) && tooBig why → attempt e ret prefix remaining version' (dropMemos edit) cs
+      -- a chunk past the memo budget (or any other shrinkable refusal) is answered by the next smaller one, from an edit that holds none of
+      -- the larger one's memos; what the smaller one makes it carries through its own checkpoints
+      Left (OutRefuse why) | not (null cs) && tooBig why → attempt e ret prefix remaining version' (dropMemos edit) True cs
+      -- and the size it reduced to goes with the checkpoint, so the next call starts there and not again at the larger chunk
+      Left (OutNeed p fs) | reduced → Left (OutNeed p (FactChunk c : fs))
+      Left (OutCheckpoint (Facts fp' fs pr)) | reduced → Left (OutCheckpoint (Facts fp' (FactChunk c : fs) pr))
       Left o → Left o
     -- a page reclaimed already is absent from the index, or was reused since and retired again under
     -- a newer version (its list keeps the number): only an index record under this entry's own version,
@@ -1339,6 +1350,8 @@ reclaimWith bounds cfg ident roots pins oldest win0 = case reclaimM of
               , mUpdates = 0
               , mRecordWrites = 0
               , mFreed = c
+              , mFactBytes = editHeldFactBytes bkEdit4
+              , mOverlayBytes = editFreshBytes bkEdit4
               }
       pure
         Plan
@@ -1502,7 +1515,7 @@ planWriteProbe bounds cfg ident roots pins pages win0 = settleAt bounds fp win $
       _ ← if null proven then pure (planEdit bounds overlayBudgetBookkeeping win) else provenFree bounds fp cfg roots pins win (Set.fromList fromLoose) proven (planEdit bounds overlayBudgetBookkeeping win)
       let n = length free
           claimed = n - length fromLoose
-          measure = Measure n 0 0 0 0 0 0 claimed (length fromLoose) 0 0 (RamCharge 0 0 0 0 0 0 0) 0 0 0
+          measure = Measure n 0 0 0 0 0 0 claimed (length fromLoose) 0 0 (RamCharge 0 0 0 0 0 0 0) 0 0 0 0 0
           authority = hAuthority (rHeader roots)
       pure . Just $
         Plan

@@ -135,14 +135,14 @@ scatteredWithTall tall frag fin noTail = (h, firstKeys, ref)
     versionOf p = maximum (0 : [v | (v, ps, _) ← entries, p `elem` ps]) ∷ Word64
     indexRecs = [(retiredKey (PageNo p), be64 (versionOf p)) | p ← retiredNos]
     -- the retirement tree: leaves of 54 index records (the first also holds the 29 entries)
-    idxGroups = chunk groupN indexRecs
+    idxGroups = if tall then balanced 60 indexRecs else chunk groupN indexRecs
     idxLeafRecs = case idxGroups of
       (g0 : gs) → (versionRecs ++ g0) : gs
       [] → []
     retireLeafBase = listBase + fromIntegral nLists
     retireLeaves = [Page TreeRetire 0 (PageNo (retireLeafBase + fromIntegral n)) (Leaf rs) | (n, rs) ← zip [0 ∷ Int ..] idxLeafRecs]
     retireInnerBase = retireLeafBase + fromIntegral (length retireLeaves)
-    retireInners = [Page TreeRetire 1 (PageNo (retireInnerBase + fromIntegral n)) (Inner [(firstKeyOf pg, childOf pg) | pg ← grp]) | (n, grp) ← zip [0 ∷ Int ..] (if frag then balanced 60 retireLeaves else chunk 136 retireLeaves)]
+    retireInners = [Page TreeRetire 1 (PageNo (retireInnerBase + fromIntegral n)) (Inner [(firstKeyOf pg, childOf pg) | pg ← grp]) | (n, grp) ← zip [0 ∷ Int ..] (if frag then balanced (if tall then 70 else 60) retireLeaves else chunk 136 retireLeaves)]
     retireRoot = Page TreeRetire 2 (PageNo (retireInnerBase + fromIntegral (length retireInners))) (Inner [(firstKeyOf pg, childOf pg) | pg ← retireInners])
     usedHw = retireInnerBase + fromIntegral (length retireInners) + 1
     -- the free extent of the fragmented layout: 256 pages past the used space of the rest, each an old version of a
@@ -437,6 +437,8 @@ specAtOnce depth = describe "round 13: the window a unit of work holds at once, 
         lim = smallest (max 16 (workOneWindowPages hr hf hrec 0 + 200) `max` 64)
         windowed = bounded lim
     heightOf h0 TreeFree `shouldBe` 2
+    -- the store is a valid one (the free tree and the retirement index at their minimum fill, counters agreeing), whatever the chunks do
+    must (checkH h0)
     (wide, _, _, _) ← must (fillCounting h0 work (planMaintenanceWith windowed (hStore h0)))
     (narrow, _, _, cps) ← must (fillCounting h0 work (planMaintenanceWith windowed {bdMemoBytes = room} (hStore h0)))
     case (wide, narrow) of
@@ -445,6 +447,19 @@ specAtOnce depth = describe "round 13: the window a unit of work holds at once, 
             freedNarrow = mFreed (plMeasure b)
         printLine ("MEMO budget at a reclamation chunk on a two-level allocator: freed " <> show freedWide <> " wide, " <> show freedNarrow <> " with room for 12 memos, " <> show cps <> " checkpoints")
         (freedWide > 8, 0 < freedNarrow && freedNarrow < freedWide, cps > 0) `shouldBe` (True, True, True)
+        -- and in a window so small that the smaller chunk itself must checkpoint before it can finish: the size it reduced to goes with its
+        -- checkpoint, so the next call starts at that size (and not again at 64, which would pass the memo budget again and loop to the
+        -- checkpoint guard), and the memos the small chunk made are kept
+        let planNarrow n = fillCounting h0 work (planMaintenanceWith ((bounded n) {bdMemoBytes = room}) (hStore h0))
+            freedAt n = case planNarrow n of
+              Right (Planned pl, _, _, k) → Just (mFreed (plMeasure pl), k)
+              _ → Nothing
+            smallestNarrow n = if n > 2 && freedAt (n - 1) /= Nothing then smallestNarrow (n - 1) else n
+            limNarrow = smallestNarrow lim
+        printLine ("MEMO budget, the smaller chunk in the smallest window it plans in (" <> show limNarrow <> " pages): " <> show (freedAt limNarrow))
+        case freedAt limNarrow of
+          Just (f, k) → (0 < f && f < freedWide, k > cps) `shouldBe` (True, True)
+          Nothing → expectationFailure "the smaller chunk did not plan in its smallest window"
       other → expectationFailure ("both plans were expected, got " <> take 300 (show other))
   it "answers the typed window result, never a checkpoint with no new fact, for every window too small to hold the edit and one proof" $ do
     let (h0, _, _) = fragmented

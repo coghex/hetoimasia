@@ -441,13 +441,39 @@ spec = describe "pinned readers, retirement and reclamation" $ do
       (Planned a, Planned b) → do
         -- a plan that ends in one window, with no checkpoint, is charged the facts it holds: the proof that each page it retires is absent from
         -- the index (one for each committed page it replaced) and the memos of its lookups, beside the pages of its window
-        (ramDecodedCopies (mRam (plMeasure a)) >= windowBytes wideWindow + windowProbesBytes wideWindow + factBytes * mReplacedRecord (plMeasure a), mReplacedRecord (plMeasure a) > 0) `shouldBe` (True, True)
+        -- the charge is its parts, each from the ledger the plan ended with: the pages of its window and its probes, the facts it holds and the new
+        -- pages it holds packed; the facts are those of each committed page it replaced (absent from the index) and the memos of its lookups, so
+        -- the charge without them is smaller by exactly what they are
+        let m = plMeasure a
+        (ramDecodedCopies (mRam m) == windowBytes wideWindow + windowProbesBytes wideWindow + mFactBytes m + mOverlayBytes m, mFactBytes m >= factBytes * mReplacedRecord m, mReplacedRecord m > 0) `shouldBe` (True, True, True)
         -- the same plan, through checkpoints, in a window that held no more than its bound
         plPages b `shouldBe` plPages a
         mPagesWritten (plMeasure b) `shouldBe` mPagesWritten (plMeasure a)
         (mWindowPages (plMeasure b) <= lim) `shouldBe` True
         cps `shouldSatisfy` (> 0)
       other → expectationFailure ("the plans were not both planned: " <> take 300 (show other))
+  it "charges a header-only plan the pages it read to find its writes were no-ops: every page of its window, in the pins and the continuation too" $ do
+    -- writes of the values the tree already holds change no page, but the plan reads the paths of the keys to know it: its window holds several
+    -- pages, and the charge counts each (the page pins and the continuation beside the decoded copies)
+    let keys = [runKey (toInteger (i `div` 50)) (toInteger (i `mod` 50)) 10 | i ← [0 .. 11999 ∷ Int]]
+        chunks [] = []
+        chunks ks = let (now, later) = splitAt (3 * maxBatchUpdates - 2) ks in now : chunks later
+        commit hh ups = do
+          (hh', out) ← commitDelta hh Ordinary (deltaFor (hStore hh) True False 1 ups)
+          case out of
+            Committed _ → Right hh'
+            other → Left ("history was not built: " <> show other)
+    h ← must (foldM (\hh ks → commit hh [(k, Just (runRec 20)) | k ← ks]) (newH smallSpec ident0) (chunks keys))
+    let same = [(runKey (toInteger c) 7 10, Just (runRec 20)) | c ← [3, 90, 170 ∷ Int]]
+        delta = deltaFor (hStore h) True False 1 same
+    (planned, w, _, _) ← must (fillCounting h (storeWindow (hStore h)) (\win → planDeltaPinned standardBounds (hCfg h) (hIdent h) (storeRoots (hStore h)) (pinnedRoots (hStore h)) win Ordinary delta))
+    case planned of
+      Planned pl → do
+        let m = plMeasure pl
+            held = windowSize w
+        (mPagesWritten m, held > 1) `shouldBe` (0, True)
+        (mWindowPages m, ramPagePins (mRam m), ramContinuation (mRam m) >= 8 * held) `shouldBe` (held, 16 * held, True)
+      other → expectationFailure ("a header-only plan was expected, got " <> take 200 (show other))
   it "refuses more readers than the bound and a token of another store" $ do
     let h = newH smallSpec ident0
         other = newH smallSpec (identOf 2 7)

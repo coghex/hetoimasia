@@ -240,6 +240,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
           , ("not free", \i → FactNotFree (PageNo (fromInteger (big i))))
           , ("gone (version and page)", \i → FactGone (fromInteger (big i)) (PageNo (fromInteger (big (i + 1)))))
           , ("not indexed", \i → FactNotIndexed (PageNo (fromInteger (big i))))
+          , ("a reduced chunk", \i → FactChunk i)
           , ("out of (a page and a root)", \i → FactOutOf (PageNo (fromInteger (big i))) (PageNo (fromInteger (big (i + 1)))))
           ]
       ]
@@ -253,6 +254,12 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
           pure (Variant ("memo of a chain, bounds of " <> show len <> " bytes") v (Just (factBytesOf (memoOf len 1))))
       | len ← [8, retireKeyBytes, maxKeyBytes]
       ]
+        -- a memo the window carries and an edit uses again is held ONCE by both: the edit keeps the window's value, not the copy the lookup
+        -- built to ask for it (measured with the window and the edit alive together, the asking copies dropped)
+        <> [ do
+               v ← retainedPer 400 (ints 400) id (\is → pure (let w = windowCheckpoint (Facts (Fingerprint ident0 1 [] []) [memoOf retireKeyBytes i | i ← is] noReadFacts) (emptyWindow ident0 1) in (w, foldl' (\e i → useMemo (memoOf retireKeyBytes i) e) (newEdit 0 w) is))) (\(w, e) → evaluate (windowFactCount w + length (editFacts e)))
+               pure (Variant "memos a window carries and an edit has used, held together (one copy of each)" v (Just (factBytesOf (memoOf retireKeyBytes 1) + 24)))
+           ]
         -- the bounds are slices of a 4 KiB page buffer when the memo is made: the memo copies them (and forces the copies), so it keeps nothing
         -- of the buffer, measured with the buffers dropped and the bounds NOT read before the measurement
         <> [ do
@@ -499,6 +506,7 @@ spec = describe "the accounted-bytes constants against what is retained (forced 
       FactGone v (PageNo p) → fromIntegral (v + p)
       FactOutOf (PageNo a) (PageNo b) → fromIntegral (a + b)
       FactNotIndexed (PageNo p) → fromIntegral p
+      FactChunk n → n
       FactEdge _ side (PageNo p) crc lo hi lvl → fromEnum side + fromIntegral p + fromIntegral crc + maybe 0 SBS.length lo + maybe 0 SBS.length hi + lvl
     page4k i = BS.pack [fromIntegral (i + j) | j ← [1 .. pageSize]]
     pageOf f = case f of

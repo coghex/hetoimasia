@@ -69,6 +69,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , dropMemos
   , withMemoCap
   , edgeFact
+  , useMemo
   , recordProof
   , editFacts
   , factBytes
@@ -309,6 +310,9 @@ data Fact
   | -- | The page number is absent from the retired-page index of the committed roots: the proof an edit makes for each page it retires
     -- before it inserts the number, so that the insertion (of a key known to be absent) reads no neighbour.
     FactNotIndexed !PageNo
+  | -- | A reclamation chunk smaller than the work limit was taken because the larger one passed the memo budget: a checkpoint carries the work
+    -- limit it reduced to, so the next call starts at that size and not again at the larger one.
+    FactChunk !Int
   | -- | The progress of one 'FactUnreachable' or 'FactRetirable' proof: the page is not reachable from THIS root (the root's page).
     -- A proof against every committed and pinned root is a unit for each, so that the window holds one root's paths at a time;
     -- the units of a page are dropped when its proof is complete.
@@ -428,6 +432,7 @@ windowCheckpoint (Facts fp fs (PackedReads rs fl)) w =
         , wProbes = Map.empty
         , wFacts = Just fp
         , wProven = settled (Set.union kept (Set.fromList fs))
+        , wWork = foldr (\f acc → case f of FactChunk n → min n acc; _ → acc) (wWork w) fs
         , wReadRecords = Map.union rs keptR
         , wReadFloors = Map.union fl keptF
         }
@@ -947,7 +952,7 @@ edgeChecked True tree leftmost ref@(DiskRef pg (Just crc)) lo hi lvl = do
     else
       if windowKnows fact (eWin e)
         -- a memo the window carries and this plan uses again is carried forward: it is one the plan made or used that a checkpoint hands on
-        then putEdit (recordFact fact e)
+        then putEdit (useMemo fact e)
         else do
           _ ← extremeLeaf tree leftmost ref lo hi lvl
           e' ← getEdit
@@ -955,6 +960,11 @@ edgeChecked True tree leftmost ref@(DiskRef pg (Just crc)) lo hi lvl = do
           let held = editHeldMemoBytes e' + factBytesOf fact
           if held > eMemoCap e' then stop (MemoOver held) else putEdit (recordFact fact e')
 edgeChecked _ tree leftmost ref lo hi lvl = () <$ extremeLeaf tree leftmost ref lo hi lvl
+
+-- | A memo the window carries, used again by an edit: the edit keeps the window's own value, not the copy a lookup built to ask for it, so
+-- the window and the edit never hold two copies of a memo.
+useMemo ∷ Fact → Edit → Edit
+useMemo fact e = let !stored = (case Set.lookupGE fact (wProven (eWin e)) of Just f | f == fact → f; _ → fact) in recordFact stored e
 
 -- | The memo of a chain, its bounds COPIED out of the page buffers they are slices of and evaluated, so that a fact never keeps a 4 KiB page
 -- alive for the bytes of a key it is charged for.
