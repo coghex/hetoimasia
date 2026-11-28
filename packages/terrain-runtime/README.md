@@ -244,10 +244,10 @@ most `limitRangeLevels`, keeping nothing of the one above (no cell above it is o
 source never changes and a change only removes, that stays true): its reads grow with the removed
 occupied cells it meets, never with the width of an empty gap. A read keeps at most what its levels can hold, a run for each
 (replacement runs are disjoint and adjacent runs may differ in tag, so tags can alternate at every level): it never cuts an answer
-short, and keeping more is a defect. Its window pins only what the reader's pin credit (85 pages)
+short, and keeping more is a defect. Its window pins only what the reader's pin credit (112 pages)
 leaves beside those runs, so the two never pass the one credit, and construction refuses query limits
-whose widest read would leave fewer than the 16 pages one read step needs (the path to the target's leaf and that of a neighbouring subtree, at most twice the tree's height; `ConfigQueryKeep`:
-`limitRangeLevels` at most 12,326; the default 8,192 keeps 196,656 bytes and leaves 167,824). A staged removal's overlay is one of the four parts of its
+whose widest read would leave fewer than the 43 pages one read step needs (at most two landings, each a root-to-leaf path and the path of the neighbouring subtree on each side, the root shared; `ConfigQueryKeep`:
+`limitRangeLevels` at most 12,326; the default 8,192 keeps 196,656 bytes and leaves 283,600). A staged removal's overlay is one of the four parts of its
 576-byte staging reservation (the decoded segment 128, its rebuilt copy 68, the overlay 216, the
 settlement's record 160), which construction checks against the constant (`ConfigRemovalStaging`).
 
