@@ -12,6 +12,7 @@ module Test.TerrainRuntime.Store.Protocol (spec, fullSpec, driveFrom) where
 import Control.Monad (foldM, forM, forM_)
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Short as SBS
 import Hetoimasia.Terrain.Coordinate (TileCoord)
 import Hetoimasia.Terrain.Discovery (Allowance (..), Env, Node (..), ReadSet (..), Record (..), RecordKey (..), Root (..), allowanceOf, envLimits, maxBatchUpdates, Step (..), candidateReport, reportWrites, pendingObligations, retainedHeader, retainedProvider, stepDiscoveryTraced, worstEdgeReads, worstEdgeWrites)
 import Hetoimasia.Terrain.Runtime.Store.Internal.Format
@@ -537,6 +538,43 @@ readPhaseSpec = describe "the read phase: records are facts, a window never hold
       -- the proof phase holds no more probes than the pages the removal writes, which 'removalWorstProbes' is derived from
       (cProbePeak (cOf tight) <= removalWorstProbes, cProbePeak (cOf std) <= removalWorstProbes) `shouldBe` (True, True)
       printLine ("READPHASE removal " <> show hops <> " hops: most probes a window held " <> show (cProbePeak (cOf tight)) <> " (tight), " <> show (cProbePeak (cOf std)) <> " (standard) of " <> show removalWorstProbes)
+  it "takes a smaller discovery batch only through a checkpoint that publishes its allowance and holds none of the window's memos, and the batch resumed from it is planned" $ do
+    -- a RAM bound that stops the batch after fewer updates (the batch of the scene is refused for it, a shrinkable refusal): the planner answers
+    -- with a checkpoint whose fact is the halved allowance, the window it hands on carries the reduced work limit and no memo, and the call
+    -- planned from that window is the smaller batch; the window the trace starts from carries a memo
+    run0 ← pure (newRun smallSpec twoOpenings 64)
+    r1 ← must (foldM (\r (x, y, z) → removeCell r (tileAt x y z)) run0 openingA)
+    let scene = runEnv run0
+        h1 = runH r1
+        store = hStore h1
+        -- room for the keys of three record writes (writeRetainedBytes each) and not of six: the batch of the scene is refused as shrinkable RAM
+        tight = standardBounds {bdWorst = worstPlanCharge {ramKeys = 4 * writeRetainedBytes}}
+        fp = fingerprintOf (hIdent h1) (storeRoots store) []
+        bound = Just (SBS.toShort (BS.replicate 8 7))
+        memo = FactEdge TreeLinks True (PageNo 5) 99 bound bound 0
+        carrying = windowCheckpoint (Facts fp [memo] noReadFacts) (limitWork 64 (storeWindow store))
+        total = cfgUsablePages (hCfg h1)
+        trace w calls (k ∷ Int)
+          | k > 4000 = Left "no answer"
+          | otherwise = case planDiscoveryWith tight scene store w of
+              Pending p → case diskRead (hDisk h1) p of
+                Just bs → either (Left . show) (\w' → trace w' calls (k + 1)) (windowInsert total p bs w)
+                Nothing → Left "missing page"
+              PendingProbes ps → trace (foldl (\w' p → windowProbe total p (maybe BS.empty id (diskRead (hDisk h1) p)) w') w ps) calls (k + 1)
+              Checkpoint facts@(Facts _ fs _) →
+                let w' = windowCheckpoint facts w
+                 in trace w' ((not (null [() | FactChunk _ ← fs]), windowWork w, windowWork w', windowMemoBytes w') : calls) (k + 1)
+              other → Right (other, reverse calls)
+    (full, _, _) ← must (fillWith h1 (planDiscovery scene store))
+    (answer, calls) ← must (trace carrying [] 0)
+    printLine ("DISCOVERY reduction under a page bound (a reduction, limit before, after, memo bytes after): " <> show calls <> "; full " <> show (case full of Planned a → (mUpdates (plMeasure a), mRecordWrites (plMeasure a), mPagesWritten (plMeasure a)); _ → (0, 0, 0)) <> "; answer " <> take 80 (show answer))
+    -- a reduction was taken, from the full limit down, and it handed on no memo
+    [() | (True, limBefore, limAfter, memos) ← calls, limAfter < limBefore, memos == 0] `shouldSatisfy` (not . null)
+    -- every checkpoint hands on a window without the memo the trace started with
+    [() | (_, _, _, memos) ← calls, memos /= 0] `shouldBe` []
+    case (full, answer) of
+      (Planned a, Planned b) → (0 < mUpdates (plMeasure b), mUpdates (plMeasure b) < mUpdates (plMeasure a), mRecordWrites (plMeasure b) <= 3) `shouldBe` (True, True, True)
+      other → expectationFailure ("both batches were expected, got " <> take 300 (show other))
   it "counts no negative window for an empty tree: every page count is zero or more at heights 0 to 8, and the first removal's promised window is a whole window" $ do
     -- an empty tree has height zero: a record write reads and replaces no page of it and a landing holds none (a negative count would have made
     -- the window of the first removal on a new store negative, refused by the window check before it began)

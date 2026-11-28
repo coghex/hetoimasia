@@ -554,18 +554,20 @@ planDiscovery = planDiscoveryWith standardBounds
 planDiscoveryWith ∷ Bounds → Env → Store → Window → Planned
 planDiscoveryWith bounds env s win0 = withWindow s win0 $ \_ →
   let (fp, win, prov) = readPhase s win0
-   in go fp win prov (min (allowWrites full) (windowWorkAtLeast discoveryUnitWrites win0)) (8 ∷ Int)
+   in go fp win prov (min (allowWrites full) (windowWorkAtLeast discoveryUnitWrites win0))
   where
     full = allowanceOf (envLimits env)
-    go fp win prov writes tries =
+    go fp win prov writes =
       case stepDiscoveryTraced env (rHeader (sRoots s)) prov (readCapped bounds full) {allowWrites = writes} of
         (Left refusal, _) → Refused (refusalOf refusal)
         (Right Idle, _) → NoWork
         (Right (Stalled key), rs) → suspendedReads bounds s fp win rs key
         (Right (Progress cand _), rs) → case settleReads bounds fp win rs (planDeltaPinned bounds (sCfg s) (sIdent s) (sRoots s) (pinnedRoots s) win Ordinary (deltaOf cand)) of
           Refused why
-            | tries > 0 && tooBig why && reportWrites (candidateReport cand) > discoveryUnitWrites →
-                go fp win prov (max discoveryUnitWrites (reportWrites (candidateReport cand) `div` 2)) (tries - 1)
+            -- a smaller batch is taken only through a CHECKPOINT that publishes the reduced allowance ('FactChunk': the work limit of the window)
+            -- and releases the memos the window held, and the next call plans it in that fresh window (the reads it made are carried as facts)
+            | tooBig why && reportWrites (candidateReport cand) > discoveryUnitWrites →
+                Checkpoint (Facts fp [FactChunk (max discoveryUnitWrites (reportWrites (candidateReport cand) `div` 2))] noReadFacts)
           other → other
     tooBig = shrinkable
 

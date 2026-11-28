@@ -24,7 +24,7 @@ import Hetoimasia.Terrain.Runtime.Store.Internal.Page (Body (..), Child (..), Pa
 import Hetoimasia.Terrain.Runtime.Store.Internal.Plan
 import Hetoimasia.Terrain.Runtime.Store.Internal.Records (Retire (..), be64, encodeFree, encodeKey, encodeRetire, encodeValue, retiredKey)
 import Hetoimasia.Terrain.Runtime.Store.Internal.State
-import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), limitWork, memoBaseBytes, memoBoundBytes, windowInsert, windowMemoBytes, windowProbe, windowWork, noReadFacts, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
+import Hetoimasia.Terrain.Runtime.Store.Internal.Tree (Fact (..), Facts (..), Stop (..), factBytesOf, limitWork, memoListCellBytes, newEdit, runM, useMemoM, withMemoCap, memoBaseBytes, memoBoundBytes, windowInsert, windowMemoBytes, windowProbe, windowWork, noReadFacts, windowCheckpoint, windowFactCount, windowFactsFor, windowKnows)
 import Test.TerrainRuntime.Output (printLine)
 import Test.Hspec
 import Test.TerrainRuntime.Store.Depth (Depth (..), atDepth)
@@ -548,6 +548,19 @@ specFingerprint = describe "round 13: the facts a window carries are trusted onl
         memo t = FactEdge t True (PageNo 5) 99 bound bound 0
         w = windowCheckpoint (Facts fp [memo TreeTodo] noReadFacts) (storeWindow (hStore h0))
     (windowKnows (memo TreeTodo) w, windowKnows (memo TreeFree) w, windowKnows (memo TreeLinks) w) `shouldBe` (True, False, False)
+
+  it "stops a plan whose first reuse of a carried memo would pass the memo budget, by the list cell the edit keeps for it" $ do
+    -- a checkpoint can hold exactly the budget; the edit's first use of a memo adds its list cell beside the window's set entry, which the
+    -- ledger charges, so the use is where the budget is checked: at the budget it stops as the shrinkable memo refusal, a cell above it plans
+    let (h0, _, _) = fragmented
+        fp = fingerprintOf (hIdent h0) (storeRoots (hStore h0)) []
+        bound = Just (toShort (be64 7))
+        memo = FactEdge TreeTodo True (PageNo 5) 99 bound bound 0
+        w = windowCheckpoint (Facts fp [memo] noReadFacts) (storeWindow (hStore h0))
+        at cap = fmap (const ()) (runM (useMemoM memo) (withMemoCap cap (newEdit 0 w)))
+    windowMemoBytes w `shouldBe` factBytesOf memo
+    at (factBytesOf memo) `shouldBe` Left (MemoOver (factBytesOf memo + memoListCellBytes))
+    at (factBytesOf memo + memoListCellBytes) `shouldBe` Right ()
 
 -- | A sparse retirement tree is corruption, not a window result: a non-root page of the retirement tree below a quarter
 -- of a payload, re-sealed with every checksum above it, is refused when a plan descends to it; before the rule a

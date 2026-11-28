@@ -71,6 +71,7 @@ module Hetoimasia.Terrain.Runtime.Store.Internal.Tree
   , withMemoCap
   , edgeFact
   , useMemo
+  , useMemoM
   , recordProof
   , editFacts
   , factBytes
@@ -962,7 +963,7 @@ edgeChecked True tree leftmost ref@(DiskRef pg (Just crc)) lo hi lvl = do
     else
       if windowKnows fact (eWin e)
         -- a memo the window carries and this plan uses again is carried forward: it is one the plan made or used that a checkpoint hands on
-        then putEdit (useMemo fact e)
+        then useMemoM fact
         else do
           _ ← extremeLeaf tree leftmost ref lo hi lvl
           e' ← getEdit
@@ -975,6 +976,15 @@ edgeChecked _ tree leftmost ref lo hi lvl = () <$ extremeLeaf tree leftmost ref 
 -- the window and the edit never hold two copies of a memo.
 useMemo ∷ Fact → Edit → Edit
 useMemo fact e = let !stored = (case Set.lookupGE fact (wProven (eWin e)) of Just f | f == fact → f; _ → fact) in recordFact stored e
+
+-- | Use a memo the window carries: the edit keeps it ('useMemo'), which the ledger charges a list cell for, so the budget is checked HERE as it is
+-- at the record of a new one: a reuse that would pass it stops the plan as the shrinkable 'MemoOver'.
+useMemoM ∷ Fact → M ()
+useMemoM fact = do
+  e ← getEdit
+  let e' = useMemo fact e
+      held = editHeldMemoBytes e'
+  if held > eMemoCap e' then stop (MemoOver held) else putEdit e'
 
 -- | The memo of a chain, its bounds COPIED out of the page buffers they are slices of and evaluated, so that a fact never keeps a 4 KiB page
 -- alive for the bytes of a key it is charged for.
